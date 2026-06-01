@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Rozpoznávanie dokladov"
+version = "1.0.0"
+id = "artifacts/ocr-web"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 26134
+
+[services.development]
+run = "pnpm --filter @workspace/ocr-web run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/ocr-web", "run", "build" ]
+publicDir = "artifacts/ocr-web/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "26134"
+BASE_PATH = "/"

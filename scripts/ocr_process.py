@@ -1,0 +1,1218 @@
+#!/usr/bin/env python3
+"""
+OCR spracovanie dokladov – webový wrapper.
+Použitie: python3 ocr_process.py <vstupny_subor> <excel_vystup>
+Výstup: JSON na stdout s extrahovanými dátami
+"""
+from pathlib import Path
+from collections import Counter
+import json
+import re
+import sys
+import time
+import cv2
+import fitz
+import numpy as np
+import pandas as pd
+import pytesseract
+
+CONFIG = {
+    "ocr_language": "slk+eng",
+    "ocr_fallback_language": "eng",
+    "tesseract_timeout_seconds": 30,
+    "faint_scan_mode": "auto",
+    "debug_enabled": False,
+    "write_ocr_text_sheet": True,
+    "validation_mode": "normal",
+    "check_tolerance": 0.002,
+    "rate_check_tolerance": 0.02,
+    "timing_enabled": False,
+    "ocr_fast_first": True,
+    "ocr_fast_accept_min_score": 70,
+    "ocr_fast_accept_min_money_count": 2,
+    "ocr_fast_accept_require_date_or_total_keyword": True,
+    "ocr_progressive_stop": True,
+    "ocr_faint_max_calls": 5,
+    "ocr_max_long_side": 2200,
+    "ocr_min_short_side": 900,
+    "pdf_dpi": 300,
+}
+
+SUPPORTED_EXTENSIONS = [".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"]
+
+
+def pdf_to_images(pdf_path: Path, dpi: int = 300):
+    doc = fitz.open(pdf_path)
+    images = []
+    for page_index in range(len(doc)):
+        page = doc[page_index]
+        zoom = dpi / 72
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        if pix.n == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+        images.append((page_index + 1, img))
+    return images
+
+
+def load_input_file(file_path: Path):
+    suffix = file_path.suffix.lower()
+    if suffix == ".pdf":
+        return pdf_to_images(file_path)
+    if suffix in [".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"]:
+        img = cv2.imread(str(file_path))
+        if img is None:
+            raise ValueError(f"Nepodarilo sa načítať obrázok: {file_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return [(1, img)]
+    raise ValueError(f"Nepodporovaný typ súboru: {suffix}")
+
+
+def _find_intervals(active, min_width):
+    intervals = []
+    start = None
+    for i, value in enumerate(active):
+        if value and start is None:
+            start = i
+        if (not value or i == len(active) - 1) and start is not None:
+            end = i - 1 if not value else i
+            if end - start + 1 >= min_width:
+                intervals.append((start, end))
+            start = None
+    return intervals
+
+
+def _projection_boxes(gray, dark_limit=180, active_threshold=0.05, smooth_frac=0.01, min_width_frac=0.12):
+    h, w = gray.shape
+    mask = (gray < dark_limit).astype(np.uint8)
+    col_projection = mask.mean(axis=0)
+    kernel_size = max(31, int(w * smooth_frac))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    smooth = np.convolve(col_projection, np.ones(kernel_size) / kernel_size, mode="same")
+    min_width = int(w * min_width_frac)
+    return _find_intervals(smooth > active_threshold, min_width=min_width), mask
+
+
+def _score_intervals(intervals, page_width):
+    if not intervals:
+        return -10_000
+    count = len(intervals)
+    widths = [x2 - x1 + 1 for x1, x2 in intervals]
+    total_width = sum(widths)
+    coverage = total_width / page_width
+    max_width = max(widths) / page_width
+    score = 0
+    if 2 <= count <= 12:
+        score += 1000 + count * 50
+    elif count == 1:
+        score += 100
+    else:
+        score -= 200
+    if count == 1 and max_width > 0.85:
+        score -= 700
+    if coverage > 0.95:
+        score -= 500
+    if any(w / page_width < 0.08 for w in widths):
+        score -= 300
+    return score
+
+
+def _merge_close_intervals(intervals, max_gap):
+    if not intervals:
+        return []
+    intervals = sorted(intervals)
+    merged = [list(intervals[0])]
+    for start, end in intervals[1:]:
+        if start - merged[-1][1] <= max_gap:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(a, b) for a, b in merged]
+
+
+def _split_box_by_seams(page_img, box):
+    x1, y1, x2, y2 = box
+    crop = page_img[y1:y2, x1:x2]
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    if w < 300 or h < 300:
+        return [box]
+    y_top = int(h * 0.12)
+    y_bottom = int(h * 0.88)
+    band = gray[y_top:y_bottom, :]
+    col_mean = band.mean(axis=0)
+    k = max(31, int(w * 0.025))
+    if k % 2 == 0:
+        k += 1
+    smooth_mean = np.convolve(col_mean, np.ones(k) / k, mode="same")
+    median_val = float(np.median(smooth_mean))
+    dark_limit = median_val - 8.0
+    dark_active = smooth_mean < dark_limit
+    ink = (band < 175).astype(np.uint8).mean(axis=0)
+    smooth_ink = np.convolve(ink, np.ones(k) / k, mode="same")
+    ink_limit = max(0.015, float(np.percentile(smooth_ink, 12)))
+    light_gap_active = smooth_ink < ink_limit
+    candidates = []
+    min_gap_width = max(8, int(w * 0.008))
+    for active, typ in [(dark_active, "dark"), (light_gap_active, "light")]:
+        intervals = _find_intervals(active, min_width=min_gap_width)
+        for a, b in intervals:
+            center = (a + b) // 2
+            if center < w * 0.18 or center > w * 0.82:
+                continue
+            left_mean = float(np.mean(smooth_mean[max(0, center - 90):max(1, center - 30)]))
+            right_mean = float(np.mean(smooth_mean[min(w, center + 30):min(w, center + 90)]))
+            seam_mean = float(np.mean(smooth_mean[a:b + 1]))
+            contrast = ((left_mean + right_mean) / 2.0) - seam_mean
+            candidates.append((contrast, a, b, center, typ))
+    split_points = []
+    for contrast, a, b, center, typ in sorted(candidates, reverse=True):
+        if typ == "dark" and contrast < 6.0:
+            continue
+        if typ == "light" and smooth_ink[center] > 0.025:
+            continue
+        if any(abs(center - p) < w * 0.07 for p in split_points):
+            continue
+        split_points.append(center)
+    split_points = sorted(split_points)
+    if not split_points:
+        return [box]
+    points = [0] + split_points + [w]
+    min_part_width = int(w * 0.22)
+    parts = []
+    for a, b in zip(points[:-1], points[1:]):
+        if b - a >= min_part_width:
+            parts.append((x1 + a, y1, x1 + b, y2))
+    return parts if len(parts) >= 2 else [box]
+
+
+def _paper_region_boxes(page_img):
+    gray = cv2.cvtColor(page_img, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    candidate_boxes = []
+    for threshold in [205, 198, 190, 180]:
+        mask = (gray > threshold).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, w // 90), max(9, h // 120)))
+        clean = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        clean = cv2.morphologyEx(clean, cv2.MORPH_OPEN, kernel, iterations=1)
+        contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for c in contours:
+            x, y, bw, bh = cv2.boundingRect(c)
+            area = bw * bh
+            if area < w * h * 0.07:
+                continue
+            if bw < w * 0.18 or bh < h * 0.25:
+                continue
+            if bw > w * 0.92 and bh > h * 0.80:
+                continue
+            pad_x = int(bw * 0.025)
+            pad_y = int(bh * 0.025)
+            boxes.append((max(0, x - pad_x), max(0, y - pad_y), min(w, x + bw + pad_x), min(h, y + bh + pad_y)))
+        if len(boxes) >= 2:
+            candidate_boxes.extend(boxes)
+            break
+    if not candidate_boxes:
+        return []
+    filtered = []
+    for box in candidate_boxes:
+        x1, y1, x2, y2 = box
+        duplicate = False
+        for fx1, fy1, fx2, fy2 in filtered:
+            inter_x1, inter_y1 = max(x1, fx1), max(y1, fy1)
+            inter_x2, inter_y2 = min(x2, fx2), min(y2, fy2)
+            inter = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+            area = (x2 - x1) * (y2 - y1)
+            farea = (fx2 - fx1) * (fy2 - fy1)
+            if inter / max(1, min(area, farea)) > 0.70:
+                duplicate = True
+                break
+        if not duplicate:
+            filtered.append(box)
+    return filtered
+
+
+def _boxes_score(boxes, page_w, page_h):
+    if not boxes:
+        return -10000
+    count = len(boxes)
+    widths = [(x2 - x1) / page_w for x1, y1, x2, y2 in boxes]
+    heights = [(y2 - y1) / page_h for x1, y1, x2, y2 in boxes]
+    score = 0
+    if 2 <= count <= 12:
+        score += 1200 + 80 * count
+    elif count == 1:
+        score += 100
+    else:
+        score -= 300
+    if count == 1 and widths[0] > 0.85:
+        score -= 800
+    if any(w < 0.12 for w in widths):
+        score -= 250
+    if any(h < 0.20 for h in heights):
+        score -= 150
+    return score
+
+
+def _trim_box_to_bright_paper(page_img, box):
+    x1, y1, x2, y2 = box
+    crop = page_img[y1:y2, x1:x2]
+    if crop.size == 0:
+        return box
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    best_active = None
+    for threshold in [200, 190, 180]:
+        bright_frac = (gray > threshold).mean(axis=1)
+        k = max(21, int(h * 0.015))
+        if k % 2 == 0:
+            k += 1
+        smooth = np.convolve(bright_frac, np.ones(k) / k, mode="same")
+        active = np.where(smooth > 0.30)[0]
+        if len(active) > h * 0.30:
+            best_active = active
+            break
+    if best_active is None:
+        return box
+    pad = int(h * 0.025)
+    ny1 = max(y1, y1 + int(best_active[0]) - pad)
+    ny2 = min(y2, y1 + int(best_active[-1]) + pad)
+    if ny2 - ny1 < (y2 - y1) * 0.25:
+        return box
+    return (x1, ny1, x2, ny2)
+
+
+def _expand_boxes_to_column_gaps(boxes, page_w, page_h):
+    if len(boxes) < 2:
+        return boxes
+    boxes = sorted(boxes, key=lambda b: (b[0], b[1]))
+    expanded = []
+    for i, box in enumerate(boxes):
+        x1, y1, x2, y2 = box
+        if i == 0:
+            nx1 = 0
+        else:
+            prev_x2 = boxes[i - 1][2]
+            gap_left = max(0, x1 - prev_x2)
+            nx1 = max(0, prev_x2 + int(gap_left * 0.08))
+        if i == len(boxes) - 1:
+            nx2 = page_w
+        else:
+            next_x1 = boxes[i + 1][0]
+            gap_right = max(0, next_x1 - x2)
+            nx2 = min(page_w, next_x1 - int(gap_right * 0.08))
+        pad_y = int(page_h * 0.01)
+        ny1 = max(0, y1 - pad_y)
+        ny2 = min(page_h, y2 + pad_y)
+        if nx2 - nx1 >= max(80, (x2 - x1) * 0.75):
+            expanded.append((nx1, ny1, nx2, ny2))
+        else:
+            expanded.append(box)
+    return expanded
+
+
+def _boxes_are_fragmented(boxes, page_w, page_h):
+    if len(boxes) <= 1:
+        return True
+    for i, a in enumerate(boxes):
+        ax1, ay1, ax2, ay2 = a
+        for b in boxes[i + 1:]:
+            bx1, by1, bx2, by2 = b
+            overlap_x = max(0, min(ax2, bx2) - max(ax1, bx1))
+            min_w = max(1, min(ax2 - ax1, bx2 - bx1))
+            same_column = overlap_x / min_w > 0.45
+            vertical_gap_or_overlap = abs(ay1 - by1) > page_h * 0.15 or abs(ay2 - by2) > page_h * 0.15
+            if same_column and vertical_gap_or_overlap:
+                return True
+    heights = [(y2 - y1) / page_h for x1, y1, x2, y2 in boxes]
+    if min(heights) < 0.32 and max(heights) > 0.55:
+        return True
+    widths = [(x2 - x1) / page_w for x1, y1, x2, y2 in boxes]
+    if len(widths) >= 3 and min(widths) < 0.18 and (max(widths) / max(min(widths), 0.001)) > 1.75:
+        return True
+    return False
+
+
+def detect_receipts(page_img):
+    rgb = page_img.copy()
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    candidate_sets = []
+    parameter_sets = [
+        (170, 0.045, 0.012, 0.10),
+        (180, 0.050, 0.012, 0.10),
+        (190, 0.065, 0.012, 0.10),
+        (200, 0.090, 0.014, 0.10),
+        (220, 0.075, 0.020, 0.10),
+    ]
+    for params in parameter_sets:
+        intervals, mask = _projection_boxes(gray, dark_limit=params[0], active_threshold=params[1], smooth_frac=params[2], min_width_frac=params[3])
+        if not intervals:
+            continue
+        boxes = []
+        x_pad = int(w * 0.012)
+        y_pad = int(h * 0.025)
+        for x_start, x_end in intervals:
+            x1 = max(0, x_start - x_pad)
+            x2 = min(w, x_end + x_pad)
+            crop_mask = mask[:, x1:x2]
+            row_projection = crop_mask.mean(axis=1)
+            row_kernel = max(31, int(h * 0.012))
+            if row_kernel % 2 == 0:
+                row_kernel += 1
+            row_smooth = np.convolve(row_projection, np.ones(row_kernel) / row_kernel, mode="same")
+            y_active = np.where(row_smooth > 0.006)[0]
+            if len(y_active) == 0:
+                y1, y2 = 0, h
+            else:
+                y1 = max(0, int(y_active[0]) - y_pad)
+                y2 = min(h, int(y_active[-1]) + y_pad)
+            boxes.append((x1, y1, x2, y2))
+        if len(boxes) == 1 and (boxes[0][2] - boxes[0][0]) > w * 0.75:
+            boxes = _split_box_by_seams(page_img, boxes[0])
+        candidate_sets.append((boxes, _boxes_score(boxes, w, h), f"projection {params}"))
+    paper_boxes = _paper_region_boxes(page_img)
+    if paper_boxes:
+        split_paper = []
+        for box in paper_boxes:
+            if (box[2] - box[0]) > w * 0.75:
+                split_paper.extend(_split_box_by_seams(page_img, box))
+            else:
+                split_paper.append(box)
+        candidate_sets.append((split_paper, _boxes_score(split_paper, w, h) + 100, "paper"))
+    if not candidate_sets:
+        return [(0, 0, w, h)]
+    candidate_sets.sort(key=lambda item: item[1], reverse=True)
+    boxes = sorted(candidate_sets[0][0], key=lambda b: (b[0], b[1]))
+    if len(boxes) == 1 and (boxes[0][2] - boxes[0][0]) > w * 0.75:
+        boxes = _split_box_by_seams(page_img, boxes[0])
+    full_split = _split_box_by_seams(page_img, (0, 0, w, h))
+    if len(full_split) >= 2 and (_boxes_are_fragmented(boxes, w, h) or len(boxes) == 1):
+        trimmed = [_trim_box_to_bright_paper(page_img, b) for b in full_split]
+        if _boxes_score(trimmed, w, h) >= _boxes_score(boxes, w, h) - 150:
+            boxes = trimmed
+    boxes = _expand_boxes_to_column_gaps(boxes, w, h)
+    return sorted(boxes, key=lambda b: (b[0], b[1]))
+
+
+def _resize_for_ocr(gray):
+    h, w = gray.shape[:2]
+    long_side = max(h, w)
+    short_side = min(h, w)
+    max_long_side = int(CONFIG.get("ocr_max_long_side", 2200) or 0)
+    min_short_side = int(CONFIG.get("ocr_min_short_side", 900) or 0)
+    scale = 1.0
+    if max_long_side > 0 and long_side > max_long_side:
+        scale = min(scale, max_long_side / float(long_side))
+    if min_short_side > 0 and short_side < min_short_side:
+        scale = max(scale, min_short_side / float(short_side))
+    if max_long_side > 0 and long_side * scale > max_long_side * 1.15:
+        scale = max_long_side / float(long_side)
+    if abs(scale - 1.0) < 0.03:
+        return gray
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+    return cv2.resize(gray, None, fx=scale, fy=scale, interpolation=interpolation)
+
+
+def generate_ocr_variants(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    gray = _resize_for_ocr(gray)
+    return [("gray", gray)]
+
+
+def _ocr_score(text):
+    norm = _normalize_text(text)
+    score = 0
+    money_count = len(re.findall(r"\d{1,6}\s*[,.]\s*\d{1,2}", text))
+    score += money_count * 8
+    for token, points in [
+        ("dph", 20), ("zaklad", 18), ("dan", 16), ("obrat", 16),
+        ("cena celkom", 25), ("hotovost", 20), ("karta", 20),
+        ("na uhradu", 25), ("doklad", 12), ("datum", 12),
+        ("zaokruhlenie", 14), ("rozpis platie", 12),
+    ]:
+        if token in norm:
+            score += points
+    score += min(len(text), 2000) / 200
+    return score
+
+
+def _ocr_feature_summary(text):
+    norm = _normalize_text(text)
+    money_count = len(re.findall(r"\d{1,6}\s*[,.]\s*\d{1,2}", text))
+    has_date = bool(re.search(r"\b\d{1,2}[.\/-]\s*\d{1,2}[.\/-]\s*\d{2,4}\b", text))
+    has_total_keyword = any(token in norm for token in ["cena celkom", "hotovost", "hotovosť", "karta", "na uhradu", "na úhradu", "ciastka", "čiastka"])
+    has_vat_keyword = any(token in norm for token in ["dph", "zaklad", "základ", "dan", "daň", "obrat", "23%", "23 %"])
+    return {"score": _ocr_score(text), "money_count": money_count, "has_date": has_date, "has_total_keyword": has_total_keyword, "has_vat_keyword": has_vat_keyword}
+
+
+def _fast_ocr_is_sufficient(text):
+    if not text or not text.strip():
+        return False
+    features = _ocr_feature_summary(text)
+    min_score = float(CONFIG.get("ocr_fast_accept_min_score", 95))
+    min_money = int(CONFIG.get("ocr_fast_accept_min_money_count", 3))
+    require_date_or_total = bool(CONFIG.get("ocr_fast_accept_require_date_or_total_keyword", True))
+    if features["score"] < min_score:
+        return False
+    if features["money_count"] < min_money:
+        return False
+    if not features["has_vat_keyword"]:
+        return False
+    if require_date_or_total and not (features["has_date"] or features["has_total_keyword"]):
+        return False
+    return True
+
+
+def _is_debug_line(line: str) -> bool:
+    return line.strip().lower().startswith("--- ocr pokus")
+
+
+def _normalize_text(value: str) -> str:
+    repl = str.maketrans({
+        "á": "a", "ä": "a", "č": "c", "ď": "d", "é": "e", "í": "i",
+        "ĺ": "l", "ľ": "l", "ň": "n", "ó": "o", "ô": "o", "ŕ": "r",
+        "š": "s", "ť": "t", "ú": "u", "ý": "y", "ž": "z",
+        "Á": "a", "Ä": "a", "Č": "c", "Ď": "d", "É": "e", "Í": "i",
+        "Ĺ": "l", "Ľ": "l", "Ň": "n", "Ó": "o", "Ô": "o", "Ŕ": "r",
+        "Š": "s", "Ť": "t", "Ú": "u", "Ý": "y", "Ž": "z",
+    })
+    value = value.translate(repl).lower()
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def parse_money_values(line):
+    if _is_debug_line(line):
+        return []
+    line = line.replace("−", "-").replace("–", "-").replace("—", "-")
+    values = []
+    seen = set()
+
+    def add_value(sign, euros, cents):
+        if len(cents) > 2:
+            cents = cents[:2]
+        if len(cents) == 1:
+            cents = cents + "0"
+        try:
+            value = float(f"{int(euros)}.{cents}")
+            if sign == "-":
+                value = -value
+            key = round(value, 2)
+            if key not in seen:
+                seen.add(key)
+                values.append(value)
+        except ValueError:
+            pass
+
+    line_num = re.sub(r"(?<![A-Za-z0-9])b\s*([,.]\s*\d{1,3})(?![A-Za-z0-9])", r"6\1", line)
+    line_num = re.sub(r"(?<![A-Za-z0-9])[OoQqDd]\s*([,.]\s*\d{1,3})(?![A-Za-z0-9])", r"0\1", line_num)
+    line_num = re.sub(r"(?<![A-Za-z0-9])[Il|]\s*([,.]\s*\d{1,3})(?![A-Za-z0-9])", r"1\1", line_num)
+    pattern = r"(?<!\d)([-+]?)\s*(\d{1,6})\s*[,.]\s*(\d{1,3})(?!\d)"
+    for sign, euros, cents in re.findall(pattern, line_num):
+        add_value(sign, euros, cents)
+    ocr_digit_map = str.maketrans({"O": "0", "o": "0", "Q": "0", "q": "0", "D": "0", "d": "0", "I": "1", "l": "1", "|": "1", "S": "5", "s": "5", "b": "6", "G": "6", "g": "6", "B": "8", "A": "4"})
+    fuzzy_pattern = r"(?<![A-Za-z0-9])([-+]?)\s*([0-9OoQqDdIl|SsBbGgA]{1,6})\s*[,.]\s*([0-9OoQqDdIl|SsBbGgA]{1,3})(?![A-Za-z0-9])"
+    for sign, euros_raw, cents_raw in re.findall(fuzzy_pattern, line):
+        euros = euros_raw.translate(ocr_digit_map)
+        cents = cents_raw.translate(ocr_digit_map)
+        if not euros.isdigit() or not cents.isdigit():
+            continue
+        add_value(sign, euros, cents)
+    return values
+
+
+def format_eur(value):
+    if value is None:
+        return None
+    return round(float(value), 2)
+
+
+def find_date(text):
+    patterns = [
+        r"\b(\d{1,2})\s*[.\/-]\s*(\d{1,2})\s*[.\/-]\s*(\d{4})\b",
+        r"\b(\d{1,2})\s*[.\/-]\s*(\d{1,2})\s*[.\/-]\s*(\d{2})\b",
+        r"\b(\d{1,2})\s+(\d{1,2})\s*[.,\/-]\s*(\d{4})\b",
+    ]
+    regular_dates = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            day, month, year = match.groups()
+            try:
+                day_i = int(day)
+                month_i = int(month)
+            except ValueError:
+                continue
+            if not (1 <= day_i <= 31 and 1 <= month_i <= 12):
+                continue
+            if len(year) == 2:
+                year = "20" + year
+            regular_dates.append((match.start(), day_i, month_i, int(year), f"{day_i:02d}.{month_i:02d}.{int(year):04d}"))
+    fuzzy_map = str.maketrans({"O": "0", "o": "0", "Q": "0", "D": "0", "A": "4", "a": "4", "I": "1", "l": "1", "|": "1", "S": "5", "s": "5", "B": "8", "G": "6", "F": "6"})
+    offset = 0
+    for raw_line in text.splitlines():
+        norm_line = _normalize_text(raw_line)
+        if any(tok in norm_line for tok in ["datum", "datun", "latum", "natum"]):
+            converted = raw_line.translate(fuzzy_map)
+            for match in re.finditer(r"\b(\d{1,2})[\s.\/-]+(\d{1,2})[\s.,\/-]+(\d{2,4})\b", converted):
+                day, month, year = match.groups()
+                try:
+                    day_i = int(day)
+                    month_i = int(month)
+                    year_i = int(year if len(year) == 4 else "20" + year)
+                except ValueError:
+                    continue
+                if 1 <= day_i <= 31 and 1 <= month_i <= 12 and 2020 <= year_i <= 2099:
+                    regular_dates.append((offset + match.start(), day_i, month_i, year_i, f"{day_i:02d}.{month_i:02d}.{year_i:04d}"))
+        offset += len(raw_line) + 1
+    compact_dates = []
+    compact_text = text.translate(str.maketrans({"O": "0", "o": "0", "F": "6", "S": "5", "B": "8", "I": "1", "l": "1"}))
+    for match in re.finditer(r"(?<!\d)(2\d)([01]\d)([0-3]\d)\d{3,}(?!\d)", compact_text):
+        yy, mm, dd = match.groups()
+        year = 2000 + int(yy)
+        month_i = int(mm)
+        day_i = int(dd)
+        if 1 <= month_i <= 12 and 1 <= day_i <= 31:
+            compact_dates.append((match.start(), day_i, month_i, year, f"{day_i:02d}.{month_i:02d}.{year:04d}"))
+    for _, rd, rm, ry, rfmt in reversed(regular_dates):
+        for _, cd, cm, cy, cfmt in compact_dates:
+            if rd == cd and rm == cm and cy != ry:
+                return cfmt
+    if regular_dates:
+        regular_dates.sort(key=lambda item: item[0])
+        return regular_dates[-1][4]
+    if compact_dates:
+        compact_dates.sort(key=lambda item: item[0])
+        return compact_dates[0][4]
+    return ""
+
+
+def _all_money_counter(text):
+    values = []
+    for line in text.splitlines():
+        if _is_debug_line(line):
+            continue
+        values.extend(round(v, 2) for v in parse_money_values(line) if 0.01 <= abs(v) <= 100000)
+    return Counter(values)
+
+
+def find_payment_total(text):
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not _is_debug_line(line)]
+    counts = _all_money_counter(text)
+    keyword_weights = [
+        ("ciastka eur", 180), ("ciastka:", 180), ("ciastka", 170), ("clastka", 160), ("ciastka, eur", 170),
+        ("na uhradu", 155), ("na ohradu", 150), ("nauhradu", 150), ("naohradu", 150),
+        ("uhradu eur", 150), ("ohradu eur", 145),
+        ("cena celkom", 145), ("cena celkom:", 150), ("lena cel", 115),
+        ("celkom:", 135), ("celkom", 125), ("clkom", 95), ("cekkom", 95), ("ceikom", 95),
+        ("sucet", 130), ("su cet", 120),
+        ("medzisucet", 110), ("medztsucet", 105), ("nedzisuce", 105),
+        ("karta", 100), ("kartou", 100),
+        ("hotovost", 82), ("hotovost:", 82), ("hotovosf", 75),
+        ("rozpis platie", 45),
+        ("spolu", 35), ("suma", 25),
+    ]
+    candidates = []
+    document_has_change = any(any(tok in _normalize_text(line) for tok in ["vratene", "vraten", "vydavok", "vydane"]) for line in lines)
+
+    def add_candidates_from_line(idx, line, base_weight, source_line):
+        values = [round(v, 2) for v in parse_money_values(line) if 0.10 <= abs(v) <= 100000]
+        for value in values:
+            if value <= 0:
+                continue
+            repeat_bonus = min(counts[value], 4) * 18
+            last_bonus = 10 if values and value == values[-1] else 0
+            norm_source = _normalize_text(source_line)
+            score = base_weight + repeat_bonus + last_bonus
+            value_count = len(values)
+            if document_has_change and any(tok in norm_source for tok in ["hotovost", "hotovosf"]):
+                score -= 95
+            if any(tok in norm_source for tok in ["vratene", "vraten", "vydavok", "vydane"]):
+                score -= 180
+            if any(tok in norm_source for tok in ["celkom", "clkom", "cekkom", "ceikom"]) and "cena celkom" not in norm_source:
+                if value_count == 1:
+                    score += 70
+                elif value_count >= 2:
+                    score -= 90
+            if any(tok in norm_source for tok in ["rekapitulacia", "sadzba", "zaklad", "zaktad", "dph", "oph", "bez dph", "bezdp h", "a 23", "23x", "23%"]) and not any(tok in norm_source for tok in ["ciastka", "clastka", "cena celkom", "karta", "na uhradu", "sucet", "medzisucet"]):
+                score -= 140
+            if re.search(r"\d{1,6}\s*[,.]\s*\d(?!\d)", source_line) and not re.search(r"\d{1,6}\s*[,.]\s*\d{2}(?!\d)", source_line):
+                score -= 35
+            candidates.append((score, value, source_line, idx))
+
+    for idx, line in enumerate(lines):
+        norm = _normalize_text(line)
+        weight = 0
+        for keyword, keyword_weight in keyword_weights:
+            if keyword in norm:
+                weight = max(weight, keyword_weight)
+        if weight == 0:
+            continue
+        add_candidates_from_line(idx, line, weight, line)
+        if not parse_money_values(line):
+            for j in range(idx + 1, min(len(lines), idx + 3)):
+                add_candidates_from_line(j, lines[j], max(30, weight - 12), f"{line} | {lines[j]}")
+
+    if candidates:
+        candidates.sort(reverse=True, key=lambda item: item[0])
+        return candidates[0][1], candidates[0][2]
+
+    fallback = []
+    for idx, line in enumerate(lines):
+        norm = _normalize_text(line)
+        if "eur" not in norm and "fur" not in norm and "evr" not in norm:
+            continue
+        if any(tok in norm for tok in ["rekapitulacia", "sadzba", "zaklad", "zaktad", "dph", "oph", "bez dph"]):
+            continue
+        for value in [round(v, 2) for v in parse_money_values(line) if 0.10 <= v <= 100000]:
+            score = min(counts[value], 4) * 20
+            if value < 1000:
+                score += 12
+            if value < 100:
+                score += 8
+            fallback.append((score, value, line, idx))
+    if fallback:
+        fallback.sort(reverse=True, key=lambda item: item[0])
+        if fallback[0][0] >= 20:
+            return fallback[0][1], fallback[0][2]
+    return None, ""
+
+
+def find_total(text):
+    total, _source = find_payment_total(text)
+    return total
+
+
+def find_rounding_amount(text):
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not _is_debug_line(line)]
+    candidates = []
+
+    def signed_values_from_rounding_line(line):
+        vals = [round(v, 2) for v in parse_money_values(line) if abs(v) <= 5]
+        if not vals:
+            return None
+        norm = line.replace("−", "-").replace("–", "-").replace("—", "-")
+        has_negative_hint = bool(re.search(r"[-]\s*0\s*[,.]\s*\d{1,2}", norm))
+        if not has_negative_hint and re.search(r"[\"'`´""|«‹]\s*0\s*[,.]\s*\d{1,2}", norm):
+            has_negative_hint = True
+        if has_negative_hint and vals[-1] > 0:
+            vals[-1] = -vals[-1]
+        return vals, has_negative_hint
+
+    for idx, line in enumerate(lines):
+        norm = _normalize_text(line)
+        if not any(token in norm for token in ["zaokruhlen", "zaokruhl", "zaokr", "rnd", "rno", "knu"]):
+            continue
+        result = signed_values_from_rounding_line(line)
+        if result:
+            values, neg_hint = result
+            value = values[-1]
+            if abs(value) <= 0.05:
+                candidates.append((1 if neg_hint else 0, idx, value, line))
+            continue
+        if idx + 1 < len(lines):
+            nxt = lines[idx + 1]
+            result = signed_values_from_rounding_line(nxt)
+            if result:
+                values, neg_hint = result
+                value = values[-1]
+                if abs(value) <= 0.05:
+                    candidates.append((1 if neg_hint else 0, idx, value, f"{line} | {nxt}"))
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        _neg, _idx, value, source = candidates[-1]
+        return value, source
+    return 0.0, ""
+
+
+def _extract_vat_line_candidates(line, total=None, rounding=0.0, prev_norm=""):
+    if _is_debug_line(line):
+        return []
+    norm = _normalize_text(line)
+    values = [round(v, 2) for v in parse_money_values(line) if 0.00 <= abs(v) <= 100000]
+    if not values:
+        return []
+    vat_context = any(token in norm for token in ["sadzba", "zaklad", "zaktad", "dph", "oph", "dan", "nan", "obrat", "23%", "23 %", "03%", "03 %", "2s%", "2s %", "a 23", "a23"])
+    if any(token in prev_norm for token in ["sadzba", "zaklad", "zaktad", "dph", "oph", "dan", "nan", "obrat", "rekapitulacia obratu", "rekapitulacia"]):
+        vat_context = True
+    if "celkom" in norm and ("23" in prev_norm or "%" in prev_norm):
+        vat_context = True
+    if re.search(r"\b(?:23|2s|2z|03|3)\s*%", line, re.IGNORECASE):
+        vat_context = True
+    if not vat_context:
+        return []
+    candidates = []
+
+    def add_candidate(zaklad, dph, obrat, source_note):
+        if zaklad is None or dph is None:
+            return
+        zaklad = round(float(zaklad), 2)
+        dph = round(float(dph), 2)
+        obrat = round(float(obrat if obrat is not None else zaklad + dph), 2)
+        if zaklad <= 0 or dph <= 0 or obrat <= 0:
+            return
+        source_note_extra = ""
+        sum_diff = abs((zaklad + dph) - obrat)
+        if sum_diff > 0.08:
+            corrected_zaklad = round(obrat - dph, 2)
+            corrected_ratio = dph / corrected_zaklad if corrected_zaklad else 0
+            expected_total = round(obrat + (rounding or 0.0), 2)
+            total_supports_obrat = total is not None and abs(float(total) - expected_total) <= max(0.10, abs(expected_total) * 0.01)
+            strong_vat_context = vat_context and ("23" in norm or "23" in prev_norm or "%" in norm or "%" in prev_norm or "dph" in norm or "dph" in prev_norm or "dan" in norm or "dan" in prev_norm or "zaklad" in norm or "zaklad" in prev_norm)
+            ratio_supports_obrat = abs(corrected_ratio - 0.23) <= 0.045
+            if corrected_zaklad > 0 and corrected_zaklad >= dph and 0.15 <= corrected_ratio <= 0.30 and (total_supports_obrat or (strong_vat_context and ratio_supports_obrat)):
+                zaklad = corrected_zaklad
+                source_note_extra = " | základ opravený"
+            else:
+                return
+        if zaklad < dph:
+            return
+        ratio = dph / zaklad if zaklad else 0
+        if not (0.15 <= ratio <= 0.30):
+            return
+        score = 100
+        if "obrat" in source_note:
+            score += 55
+        elif "základ a DPH" in source_note and len(values) >= 3:
+            score -= 55
+        if "23" in norm or "23" in prev_norm:
+            score += 25
+        if "dph" in norm or "oph" in norm or "dan" in norm or "nan" in norm or "dph" in prev_norm or "dan" in prev_norm:
+            score += 18
+        if "zaklad" in norm or "zaktad" in norm or "zaklad" in prev_norm:
+            score += 12
+        if "obrat" in norm or "obrat" in prev_norm:
+            score += 12
+        if "rekapitulacia" in prev_norm or "rekapitulacia" in norm:
+            score += 5
+        score += max(0, 30 - abs(ratio - 0.23) * 550)
+        expected_total = round(obrat + (rounding or 0.0), 2)
+        if total is not None:
+            pay_diff = abs(expected_total - total)
+            if pay_diff <= 0.05:
+                score += 90
+            elif pay_diff <= 0.20:
+                score += 30
+            elif pay_diff > max(0.50, total * 0.05):
+                score -= 25
+        candidates.append({"score": score, "zaklad_dph": zaklad, "dph": dph, "obrat_dph": obrat, "spolu_s_dph": round(total, 2) if total is not None else expected_total, "ratio": ratio, "source_line": line, "source_note": f"{source_note}{source_note_extra}"})
+
+    if len(values) >= 3:
+        for i in range(0, len(values) - 2):
+            add_candidate(values[i], values[i + 1], values[i + 2], "riadok obsahuje základ, DPH/daň a obrat")
+        add_candidate(values[-3], values[-2], values[-1], "riadok obsahuje základ, DPH/daň a obrat")
+
+    for i, zaklad in enumerate(values):
+        for j, dph in enumerate(values):
+            if i == j:
+                continue
+            if zaklad <= 0 or dph <= 0:
+                continue
+            if zaklad < dph:
+                continue
+            ratio = dph / zaklad
+            if not (0.18 <= ratio <= 0.30):
+                continue
+            add_candidate(zaklad, dph, None, "základ a DPH z riadku")
+
+    return candidates
+
+
+def find_vat_table(text, total=None):
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not _is_debug_line(line)]
+    payment_total, payment_source = find_payment_total(text)
+    if payment_total is not None:
+        total = payment_total
+    rounding, rounding_source = find_rounding_amount(text)
+    best = {"zaklad_dph": None, "dph": None, "obrat_dph": None, "zaokruhlenie": rounding, "spolu_s_dph": total, "sadzba_dph": "", "payment_total": total, "payment_source": payment_source, "rounding_source": rounding_source, "vat_source": ""}
+    candidate_rows = []
+    for idx, line in enumerate(lines):
+        prev_norm = _normalize_text(lines[idx - 1]) if idx > 0 else ""
+        for candidate in _extract_vat_line_candidates(line, total=total, rounding=rounding, prev_norm=prev_norm):
+            candidate_rows.append(candidate)
+    if candidate_rows:
+        candidate_rows.sort(reverse=True, key=lambda item: item["score"])
+        selected = candidate_rows[0]
+        if total is not None and rounding is not None:
+            corrected_obrat = round(float(total) - float(rounding or 0.0), 2)
+            if abs((selected["zaklad_dph"] + selected["dph"]) - corrected_obrat) <= 0.08:
+                selected["obrat_dph"] = corrected_obrat
+        expected_total = round(selected["obrat_dph"] + (rounding or 0.0), 2)
+        total_is_bad = total is None or abs(float(total) - expected_total) > max(0.08, min(0.20, abs(expected_total) * 0.003))
+        payment_source_norm = _normalize_text(payment_source or "")
+        text_has_change = any(tok in _normalize_text(text) for tok in ["vratene", "vraten", "vydavok", "vydane"])
+        hotovost_with_change = text_has_change and any(tok in payment_source_norm for tok in ["hotovost", "hotovosf"])
+        has_direct_payment_source = any(tok in payment_source_norm for tok in ["na uhradu", "cena celkom", "celkom", "karta", "ciastka", "clastka", "sucet", "medzisucet"])
+        short_cent_payment_source = bool(re.search(r"\d{1,6}\s*[,.]\s*\d(?!\d)", payment_source or "") and not re.search(r"\d{1,6}\s*[,.]\s*\d{2}(?!\d)", payment_source or ""))
+        celkom_payment_source = any(tok in payment_source_norm for tok in ["celkom", "clkom", "cekkom", "ceikom"])
+        if total_is_bad and hotovost_with_change:
+            total = selected["obrat_dph"]
+            payment_source = f"{payment_source} | hotovosť s výdavkom; suma dokladu opravená"
+        elif total_is_bad and short_cent_payment_source and celkom_payment_source:
+            total = selected["obrat_dph"]
+            payment_source = f"{payment_source} | suma opravená podľa Obrat DPH"
+        elif total_is_bad and not has_direct_payment_source:
+            total = expected_total
+            payment_source = payment_source or "úhrada odvodená z Obrat DPH + zaokrúhlenie"
+        best["zaklad_dph"] = selected["zaklad_dph"]
+        best["dph"] = selected["dph"]
+        best["obrat_dph"] = selected["obrat_dph"]
+        best["spolu_s_dph"] = round(total, 2) if total is not None else selected["obrat_dph"]
+        best["payment_total"] = round(total, 2) if total is not None else None
+        best["payment_source"] = payment_source
+        best["sadzba_dph"] = "23 %"
+        best["vat_source"] = f"DPH z bloku: {selected['source_line']}"
+        return best
+    if total is not None:
+        best["spolu_s_dph"] = round(total, 2)
+        best["payment_total"] = round(total, 2)
+        best["vat_source"] = "DPH sa nepodarilo prečítať"
+    return best
+
+
+def find_largest_item(text, total=None):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    admin_tokens = ["dph", "zaklad", "sadzba", "dan", "obrat", "rekapitulacia", "zaokruh", "spolu", "celkom", "uhrad", "hotovost", "hotovosf", "vratene", "vraten", "vydavok", "vydane", "karta", "kartou", "platba", "ciastka", "clastka", "medzisucet", "pokladnica", "pokladna", "doklad", "datum", "datun", "duzp", "cas:", "ico", "ic dph", "dic", "kp:", "cislo", "registracie", "drzitel", "drzitela", "meno", "okp", "uid", "overte", "qr", "ekasa", "terminal", "clerk", "contactless", "mastercard", "autoriz", "potvrdenka", "zakaznika", "uschovajte", "dakujeme", "dakujem", "mohli", "bodov", "body", "prevadzka", "hlavna", "pezinok", "vinicne", "hornbach", "galvaniho", "raca", "rozpis plat", "rozpis", "fakturu", "uctenky", "nepouzit", "podmienok"]
+    item_hint_tokens = ["lpg", "natural", "nafta", "diesel", "benzin", "benz", "tmel", "plech", "lak", "pies", "krmivo", "aqua", "profil", "sada", "kliest", "kliesti", "klesti", "kliešt", "konc", "st(", "st (", "ks", "kus", "kg"]
+    unit_tokens_re = r"\b(l|ks|kus|kg|g|bal|balenie|m|m2|m3|ml|l\.)\b|\bx\b"
+    currency_noise_re = r"\b(eur|fur|eir|cur|cui|fike|fik|ats|bur)\b"
+
+    def has_admin(norm_line):
+        return any(token in norm_line for token in admin_tokens)
+
+    def has_item_hint(norm_line):
+        return any(token in norm_line for token in item_hint_tokens)
+
+    def clean_desc(value):
+        value = re.sub(r"\s+", " ", value).strip(" |;:-")
+        for src, dst in {"FUR": "EUR", "EIR": "EUR", "CUR": "EUR", "CUI": "EUR", "Fike": "EUR", "BUR": "EUR"}.items():
+            value = value.replace(src, dst)
+        return value
+
+    candidates = []
+    last_description = ""
+    context_ttl = 0
+
+    for raw_line in lines:
+        if _is_debug_line(raw_line):
+            last_description = ""
+            context_ttl = 0
+            continue
+        segments = [segment.strip() for segment in re.split(r"\s+\|\s+", raw_line) if segment.strip()]
+        for line in segments:
+            norm_line = _normalize_text(line)
+            values = parse_money_values(line)
+            if has_admin(norm_line):
+                last_description = ""
+                context_ttl = 0
+                continue
+            stripped = re.sub(r"[-+]?\d+\s*[,.]\s*\d{1,3}|\d+", " ", norm_line)
+            stripped = re.sub(currency_noise_re, " ", stripped)
+            letters = re.sub(r"[^a-z]+", "", stripped)
+            if not values:
+                if len(letters) >= 3 and (has_item_hint(norm_line) or len(norm_line) <= 70):
+                    last_description = clean_desc(line)
+                    context_ttl = 2
+                continue
+            has_unit = bool(re.search(unit_tokens_re, norm_line))
+            product_context = bool(last_description and context_ttl > 0 and (has_item_hint(_normalize_text(last_description)) or has_unit))
+            item_hint = has_item_hint(norm_line) or product_context
+            is_vat = re.match(r"^\s*(23|20|19|10|5|0|13|2s)\s*[%.,]", norm_line) or (len(values) >= 3 and not re.search(unit_tokens_re, norm_line) and not has_item_hint(norm_line))
+            if is_vat and not item_hint:
+                continue
+            if len(letters) < 3 and not item_hint:
+                continue
+            price = round(values[-1], 2)
+            if price < 0.05:
+                continue
+            if total and price > float(total) + 0.20:
+                continue
+            description = clean_desc(f"{last_description} | {line}") if product_context else clean_desc(line)
+            score = price
+            if item_hint:
+                score += 100
+            if has_unit:
+                score += 25
+            if re.search(r"\b(eur|fur|eir|cur)\b", norm_line):
+                score += 10
+            if total:
+                score += min(price, float(total)) / max(float(total), 1.0) * 10
+            candidates.append((score, price, description))
+            if has_item_hint(norm_line):
+                last_description = clean_desc(line)
+                context_ttl = 2
+            elif context_ttl > 0:
+                context_ttl -= 1
+
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return candidates[0][2]
+
+
+def parse_receipt_text(text, receipt_id, file_name):
+    payment_total, payment_source = find_payment_total(text)
+    vat = find_vat_table(text, total=payment_total)
+    return {
+        "nazovSuboru": file_name,
+        "doklad": receipt_id if receipt_id != 0 else None,
+        "stav": "OK",
+        "datumVystavenia": find_date(text),
+        "sadzbaDph": vat["sadzba_dph"],
+        "zakladDph": format_eur(vat["zaklad_dph"]),
+        "dph": format_eur(vat["dph"]),
+        "obratDph": format_eur(vat.get("obrat_dph")),
+        "zaokruhlenie": format_eur(vat.get("zaokruhlenie", 0.0)),
+        "spoluSDph": format_eur(vat["spolu_s_dph"]),
+        "sumaNaUhradu": format_eur(vat.get("payment_total", payment_total)),
+        "popisNajvacsejPolozky": find_largest_item(text, total=vat["spolu_s_dph"]),
+    }
+
+
+def is_valid_receipt_row(row):
+    has_date = bool(row.get("datumVystavenia"))
+    has_total = row.get("sumaNaUhradu") is not None or row.get("spoluSDph") is not None
+    has_vat = row.get("dph") is not None
+    has_item = bool(row.get("popisNajvacsejPolozky"))
+    return (has_total or has_vat) and (has_date or has_item)
+
+
+def make_not_found_row(file_name):
+    return {
+        "nazovSuboru": file_name,
+        "doklad": None,
+        "stav": "blok nenajdeny",
+        "datumVystavenia": "",
+        "sadzbaDph": "",
+        "zakladDph": None,
+        "dph": None,
+        "obratDph": None,
+        "zaokruhlenie": None,
+        "spoluSDph": None,
+        "sumaNaUhradu": None,
+        "popisNajvacsejPolozky": "",
+    }
+
+
+def run_ocr(img):
+    ocr_results = []
+    calls = 0
+
+    def combine_results(limit=8):
+        if not ocr_results:
+            return ""
+        ocr_results.sort(reverse=True, key=lambda item: item[0])
+        combined_parts = []
+        seen_lines = set()
+        for score, label, text in ocr_results[:limit]:
+            combined_parts.append(f"\n--- OCR pokus {label}, score={score:.1f} ---")
+            for line in text.splitlines():
+                clean = line.strip()
+                if not clean:
+                    continue
+                key = re.sub(r"\s+", " ", clean.lower())
+                if key in seen_lines:
+                    continue
+                seen_lines.add(key)
+                combined_parts.append(clean)
+        return "\n".join(combined_parts).strip()
+
+    def _parsed_text_has_key_fields(text):
+        if not text or not text.strip():
+            return False
+        try:
+            row = parse_receipt_text(text, 0, "__ocr_check__")
+        except Exception:
+            return False
+        total = row.get("sumaNaUhradu") is not None or row.get("spoluSDph") is not None
+        dph = row.get("dph") is not None
+        zaklad = row.get("zakladDph") is not None
+        obrat = row.get("obratDph") is not None
+        date = bool(row.get("datumVystavenia"))
+        if total and dph and (obrat or zaklad):
+            return True
+        if total and date and (dph or obrat or zaklad):
+            return True
+        return False
+
+    def should_stop_progressively():
+        if not CONFIG.get("ocr_progressive_stop", True):
+            return False
+        return _parsed_text_has_key_fields(combine_results(limit=8))
+
+    def run_one(part_img, label, psm):
+        nonlocal calls
+        variants = dict(generate_ocr_variants(part_img))
+        processed = variants.get("gray")
+        if processed is None:
+            return False
+        timeout = int(CONFIG.get("tesseract_timeout_seconds", 30))
+        primary_lang = str(CONFIG.get("ocr_language", "slk+eng") or "slk+eng")
+        fallback_lang = str(CONFIG.get("ocr_fallback_language", "eng") or "").strip()
+        config_str = f"--oem 3 --psm {psm}"
+        calls += 1
+        try:
+            text = pytesseract.image_to_string(processed, lang=primary_lang, config=config_str, timeout=timeout)
+        except RuntimeError:
+            text = ""
+        except Exception:
+            text = ""
+        if not text.strip() and fallback_lang:
+            try:
+                text = pytesseract.image_to_string(processed, lang=fallback_lang, config=config_str, timeout=timeout)
+            except Exception:
+                text = ""
+        if text.strip():
+            ocr_results.append((_ocr_score(text), f"{label}:gray:psm{psm}", text))
+        return should_stop_progressively()
+
+    h, w = img.shape[:2]
+    gray0 = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    faint_mode = str(CONFIG.get("faint_scan_mode", "auto")).strip().lower()
+    if faint_mode == "always":
+        faint = True
+    elif faint_mode in {"off", "false", "0", "disabled"}:
+        faint = False
+    else:
+        faint = (float(np.percentile(gray0, 95)) < 240) or (float(np.median(gray0)) < 230)
+
+    if CONFIG.get("ocr_fast_first", True):
+        stopped = run_one(img, "fast_full", 6)
+        fast_text = combine_results(limit=3)
+        fast_ok = _fast_ocr_is_sufficient(fast_text)
+        parsed_ok = stopped or _parsed_text_has_key_fields(fast_text)
+        if fast_text and faint_mode != "always" and parsed_ok:
+            return fast_text
+
+    max_calls = int(CONFIG.get("ocr_faint_max_calls", 5) or 0)
+
+    def call_allowed():
+        return max_calls <= 0 or calls < max_calls
+
+    if faint or faint_mode == "always":
+        stages = [(img, "full", 4)]
+        payband = img[int(h * 0.36):int(h * 0.84), :]
+        if payband.size:
+            stages.append((payband, "payband", 6))
+        dphtable = img[int(h * 0.43):int(h * 0.75), :]
+        if dphtable.size:
+            stages.append((dphtable, "dphtable", 6))
+        topband = img[0:int(h * 0.48), :]
+        if topband.size:
+            stages.append((topband, "topband", 6))
+        if dphtable.size:
+            stages.append((dphtable, "dphtable", 4))
+        if topband.size:
+            stages.append((topband, "topband", 4))
+        for part_img, label, psm in stages:
+            if not call_allowed():
+                break
+            if run_one(part_img, label, psm):
+                break
+    else:
+        stages = [(img, "full", 4)]
+        lowerband = img[int(h * 0.35):, :]
+        if lowerband.size:
+            stages.append((lowerband, "lowerband", 6))
+        for part_img, label, psm in stages:
+            if run_one(part_img, label, psm):
+                break
+
+    return combine_results(limit=8)
+
+
+def save_excel(rows, output_path: Path):
+    excel_rows = []
+    for row in rows:
+        excel_rows.append({
+            "Názov súboru": row.get("nazovSuboru", ""),
+            "Doklad": row.get("doklad", ""),
+            "Stav": row.get("stav", ""),
+            "Dátum vystavenia": row.get("datumVystavenia", ""),
+            "Sadzba DPH": row.get("sadzbaDph", ""),
+            "Základ DPH": row.get("zakladDph"),
+            "DPH": row.get("dph"),
+            "Suma na úhradu": row.get("sumaNaUhradu"),
+            "Spolu s DPH": row.get("spoluSDph"),
+            "Obrat DPH": row.get("obratDph"),
+            "Zaokrúhlenie": row.get("zaokruhlenie"),
+            "Popis najväčšej položky": row.get("popisNajvacsejPolozky", ""),
+        })
+    df = pd.DataFrame(excel_rows)
+    visible_cols = ["Názov súboru", "Doklad", "Stav", "Dátum vystavenia", "Sadzba DPH", "Základ DPH", "DPH", "Suma na úhradu", "Spolu s DPH", "Obrat DPH", "Zaokrúhlenie", "Popis najväčšej položky"]
+    for col in visible_cols:
+        if col not in df.columns:
+            df[col] = ""
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        df[visible_cols].to_excel(writer, sheet_name="Doklady", index=False)
+        ws = writer.book["Doklady"]
+        ws["M1"] = "Check súčet DPH"
+        ws["N1"] = "Kontrola súčtu"
+        tolerance = 0.002
+        for row_idx in range(2, ws.max_row + 1):
+            ws[f"M{row_idx}"] = f"=IFERROR(F{row_idx}+G{row_idx}-J{row_idx},\"\")"
+            ws[f"N{row_idx}"] = f"=IF(M{row_idx}=\"\",\"\",IF(ABS(M{row_idx})>{tolerance},\"Chyba\",\"OK\"))"
+        widths = {"A": 34, "B": 10, "C": 18, "D": 18, "E": 16, "F": 14, "G": 12, "H": 14, "I": 14, "J": 14, "K": 16, "L": 60}
+        for col, width in widths.items():
+            ws.column_dimensions[col].width = width
+        for row in ws.iter_rows(min_row=2, min_col=6, max_col=11):
+            for cell in row:
+                cell.number_format = '#,##0.00 €'
+
+
+def process_file(file_path: Path):
+    pages = load_input_file(file_path)
+    rows = []
+    receipt_counter = 1
+
+    for page_number, page_img in pages:
+        boxes = detect_receipts(page_img)
+        for box in boxes:
+            x1, y1, x2, y2 = box
+            h, w = page_img.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            receipt_img = page_img[y1:y2, x1:x2]
+            if receipt_img.size == 0:
+                continue
+            ocr_text = run_ocr(receipt_img)
+            row = parse_receipt_text(ocr_text, receipt_counter, file_path.name)
+            if is_valid_receipt_row(row):
+                rows.append(row)
+                receipt_counter += 1
+            else:
+                rows.append(make_not_found_row(file_path.name))
+
+    if not rows:
+        rows.append(make_not_found_row(file_path.name))
+
+    return rows
+
+
+def main():
+    if len(sys.argv) < 3:
+        print(json.dumps({"error": "Použitie: ocr_process.py <vstup> <excel_vystup>"}))
+        sys.exit(1)
+
+    input_path = Path(sys.argv[1])
+    excel_path = Path(sys.argv[2])
+
+    if not input_path.exists():
+        print(json.dumps({"error": f"Súbor nenájdený: {input_path}"}))
+        sys.exit(1)
+
+    rows = process_file(input_path)
+    save_excel(rows, excel_path)
+
+    valid = sum(1 for r in rows if r.get("stav") == "OK")
+    result = {
+        "rows": rows,
+        "totalReceipts": len(rows),
+        "validReceipts": valid,
+    }
+    print(json.dumps(result, ensure_ascii=False, default=str))
+
+
+if __name__ == "__main__":
+    main()

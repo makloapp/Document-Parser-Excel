@@ -3,13 +3,15 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: OCR Doklady API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: ocr
+    description: OCR spracovanie dokladov
 paths:
   /healthz:
     get:
@@ -24,6 +26,82 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /ocr/process:
+    post:
+      operationId: processReceipt
+      tags: [ocr]
+      summary: Spracuj doklad cez OCR
+      description: Nahraj fotku dokladu, vráti extrahované dáta a ID jobu pre stiahnutie Excelu
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/ReceiptUpload"
+      responses:
+        "200":
+          description: Spracované úspešne
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OcrJobResult"
+        "400":
+          description: Chybný vstup
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Chyba spracovania
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /ocr/download/{jobId}:
+    get:
+      operationId: downloadExcel
+      tags: [ocr]
+      summary: Stiahni Excel výstup
+      description: Vráti Excel súbor vygenerovaný z OCR jobu
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Excel súbor
+          content:
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Job nenájdený
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /ocr/jobs:
+    get:
+      operationId: listJobs
+      tags: [ocr]
+      summary: Zoznam posledných jobov
+      description: Vráti históriu spracovaných dokladov v tejto relácii
+      responses:
+        "200":
+          description: Zoznam jobov
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/OcrJobSummary"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +112,98 @@ components:
       required:
         - status
 
+    ReceiptUpload:
+      type: object
+      properties:
+        file:
+          type: string
+          description: Meno súboru dokladu (JPG alebo PNG)
+      required:
+        - file
+
+    ReceiptRow:
+      type: object
+      properties:
+        nazovSuboru:
+          type: string
+        doklad:
+          type: ["integer", "null"]
+        stav:
+          type: string
+        datumVystavenia:
+          type: string
+        sadzbaDph:
+          type: string
+        zakladDph:
+          type: ["number", "null"]
+        dph:
+          type: ["number", "null"]
+        obratDph:
+          type: ["number", "null"]
+        zaokruhlenie:
+          type: ["number", "null"]
+        spoluSDph:
+          type: ["number", "null"]
+        sumaNaUhradu:
+          type: ["number", "null"]
+        popisNajvacsejPolozky:
+          type: string
+      required:
+        - nazovSuboru
+        - stav
+        - datumVystavenia
+        - sadzbaDph
+        - popisNajvacsejPolozky
+
+    OcrJobResult:
+      type: object
+      properties:
+        jobId:
+          type: string
+        fileName:
+          type: string
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReceiptRow"
+        totalReceipts:
+          type: integer
+        validReceipts:
+          type: integer
+        processingTimeMs:
+          type: number
+      required:
+        - jobId
+        - fileName
+        - rows
+        - totalReceipts
+        - validReceipts
+        - processingTimeMs
+
+    OcrJobSummary:
+      type: object
+      properties:
+        jobId:
+          type: string
+        fileName:
+          type: string
+        totalReceipts:
+          type: integer
+        validReceipts:
+          type: integer
+        processedAt:
+          type: string
+      required:
+        - jobId
+        - fileName
+        - totalReceipts
+        - validReceipts
+        - processedAt
+
+    ApiError:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error

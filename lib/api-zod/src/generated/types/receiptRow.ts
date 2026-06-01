@@ -5,14 +5,6 @@
  * OCR Doklady API
  * OpenAPI spec version: 0.1.0
  */
-export interface HealthStatus {
-  status: string;
-}
-
-export interface ReceiptUpload {
-  /** Meno súboru dokladu (JPG alebo PNG) */
-  file: string;
-}
 
 export interface ReceiptRow {
   nazovSuboru: string;
@@ -35,25 +27,3 @@ export interface ReceiptRow {
   sumaNaUhradu?: number | null;
   popisNajvacsejPolozky: string;
 }
-
-export interface OcrJobResult {
-  jobId: string;
-  fileName: string;
-  rows: ReceiptRow[];
-  totalReceipts: number;
-  validReceipts: number;
-  processingTimeMs: number;
-}
-
-export interface OcrJobSummary {
-  jobId: string;
-  fileName: string;
-  totalReceipts: number;
-  validReceipts: number;
-  processedAt: string;
-}
-
-export interface ApiError {
-  error: string;
-}
-

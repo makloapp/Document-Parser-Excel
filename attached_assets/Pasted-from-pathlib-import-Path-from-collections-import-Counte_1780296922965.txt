@@ -1,0 +1,2118 @@
+from pathlib import Path
+from collections import Counter
+import json
+import re
+import sys
+import time
+import cv2
+import fitz  # PyMuPDF
+import numpy as np
+import pandas as pd
+import pytesseract
+
+DEFAULT_CONFIG = {
+    "input_dir": "Input",
+    "legacy_input_dir": "input",
+    "use_legacy_input_dir_if_primary_empty": True,
+    "output_dir": "output",
+    "debug_dir": "debug",
+    "output_filename": "doklady_vystup.xlsx",
+    "supported_extensions": [".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"],
+    "pdf_dpi": 300,
+    "ocr_language": "slk+eng",
+    "ocr_fallback_language": "eng",
+    "tesseract_timeout_seconds": 12,
+    "faint_scan_mode": "auto",
+    "debug_enabled": True,
+    "write_ocr_text_sheet": True,
+    "validation_mode": "normal",
+    "check_tolerance": 0.002,
+    "rate_check_tolerance": 0.02,
+    "timing_enabled": True,
+    "ocr_fast_first": True,
+    "ocr_fast_accept_min_score": 70,
+    "ocr_fast_accept_min_money_count": 2,
+    "ocr_fast_accept_require_date_or_total_keyword": True,
+    "ocr_progressive_stop": True,
+    "ocr_faint_max_calls": 5,
+    "ocr_max_long_side": 2200,
+    "ocr_min_short_side": 900
+}
+
+
+def _deep_merge(defaults, overrides):
+    merged = dict(defaults)
+    for key, value in overrides.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_config(config_path: Path = Path("config.json")):
+    """
+    Načíta nastavenia z config.json.
+    Ak súbor neexistuje, vytvorí sa s predvolenými hodnotami.
+    Program tak funguje aj bez konfigurácie, ale nastavenia sa dajú meniť bez úprav kódu.
+    """
+    if not config_path.exists():
+        config_path.write_text(
+            json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return dict(DEFAULT_CONFIG)
+
+    try:
+        user_config = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Neplatný config.json: {exc}")
+
+    return _deep_merge(DEFAULT_CONFIG, user_config)
+
+
+CONFIG = load_config()
+
+INPUT_DIR = Path(CONFIG.get("input_dir", "Input"))
+LEGACY_INPUT_DIR = Path(CONFIG.get("legacy_input_dir", "input"))
+OUTPUT_DIR = Path(CONFIG.get("output_dir", "output"))
+DEBUG_DIR = Path(CONFIG.get("debug_dir", "debug"))
+SUPPORTED_EXTENSIONS = tuple(ext.lower() for ext in CONFIG.get("supported_extensions", DEFAULT_CONFIG["supported_extensions"]))
+
+OUTPUT_DIR.mkdir(exist_ok=True)
+if CONFIG.get("debug_enabled", True):
+    DEBUG_DIR.mkdir(exist_ok=True)
+
+
+def timing_enabled():
+    return bool(CONFIG.get("timing_enabled", True))
+
+
+def log_time(label: str, seconds: float, indent: int = 0):
+    if timing_enabled():
+        print(f"{' ' * indent}{label}: {seconds:.2f} s")
+
+
+def supported_input_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+
+
+def _list_input_files(input_dir: Path):
+    return sorted(
+        [path for path in input_dir.iterdir() if supported_input_file(path)],
+        key=lambda path: path.name.lower(),
+    )
+
+
+def _list_pdf_files(input_dir: Path):
+    # Kompatibilita so staršími časťami kódu / poznámkami.
+    return _list_input_files(input_dir)
+
+
+def select_default_input_dir():
+    """
+    Linux rozlišuje veľké/malé písmená. Primárny priečinok je Input,
+    ale kvôli kompatibilite použijeme aj input, ak už existuje a obsahuje vstupné súbory.
+    Podporované sú PDF aj obrázky: JPG/JPEG/PNG/TIF/TIFF/WEBP.
+    """
+    if INPUT_DIR.exists() and _list_input_files(INPUT_DIR):
+        return INPUT_DIR
+    if (
+        CONFIG.get("use_legacy_input_dir_if_primary_empty", True)
+        and LEGACY_INPUT_DIR.exists()
+        and _list_input_files(LEGACY_INPUT_DIR)
+    ):
+        return LEGACY_INPUT_DIR
+    if INPUT_DIR.exists():
+        return INPUT_DIR
+    if LEGACY_INPUT_DIR.exists():
+        return LEGACY_INPUT_DIR
+    return INPUT_DIR
+
+def pdf_to_images(pdf_path: Path, dpi: int | None = None):
+    if dpi is None:
+        dpi = int(CONFIG.get("pdf_dpi", 300))
+    doc = fitz.open(pdf_path)
+    images = []
+    for page_index in range(len(doc)):
+        page = doc[page_index]
+        zoom = dpi / 72
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        if pix.n == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+        images.append((page_index + 1, img))
+    return images
+
+
+def load_input_file(file_path: Path):
+    suffix = file_path.suffix.lower()
+    if suffix == ".pdf":
+        return pdf_to_images(file_path)
+    if suffix in [".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"]:
+        img = cv2.imread(str(file_path))
+        if img is None:
+            raise ValueError(f"Nepodarilo sa načítať obrázok: {file_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return [(1, img)]
+    raise ValueError(f"Nepodporovaný typ súboru: {suffix}")
+
+
+def _find_intervals(active, min_width):
+    intervals = []
+    start = None
+    for i, value in enumerate(active):
+        if value and start is None:
+            start = i
+        if (not value or i == len(active) - 1) and start is not None:
+            end = i - 1 if not value else i
+            if end - start + 1 >= min_width:
+                intervals.append((start, end))
+            start = None
+    return intervals
+
+
+def _projection_boxes(gray, dark_limit=180, active_threshold=0.05, smooth_frac=0.01, min_width_frac=0.12):
+    """
+    Vráti x-intervaly bločkov podľa vertikálnej projekcie tmavých pixelov.
+    dark_limit držíme skôr nižšie, aby sa do masky nedostal sivý/zažltnutý podklad.
+    """
+    h, w = gray.shape
+
+    mask = (gray < dark_limit).astype(np.uint8)
+    col_projection = mask.mean(axis=0)
+
+    kernel_size = max(31, int(w * smooth_frac))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    smooth = np.convolve(
+        col_projection,
+        np.ones(kernel_size) / kernel_size,
+        mode="same",
+    )
+
+    min_width = int(w * min_width_frac)
+    return _find_intervals(smooth > active_threshold, min_width=min_width), mask
+
+
+def _score_intervals(intervals, page_width):
+    """
+    Vyberá najpravdepodobnejšie rozdelenie na bločky.
+    Penalizuje jeden interval cez skoro celú stránku, lebo to je typický prípad,
+    keď sa do detekcie dostal tieň / sivý podklad / okraj papiera.
+    """
+    if not intervals:
+        return -10_000
+
+    count = len(intervals)
+    widths = [x2 - x1 + 1 for x1, x2 in intervals]
+    total_width = sum(widths)
+    coverage = total_width / page_width
+    max_width = max(widths) / page_width
+
+    score = 0
+
+    # Pri skenoch s viacerými bločkami je viac intervalov lepší signál ako jeden veľký.
+    if 2 <= count <= 12:
+        score += 1000 + count * 50
+    elif count == 1:
+        score += 100
+    else:
+        score -= 200
+
+    # Jeden interval takmer cez celú šírku stránky väčšinou znamená spojenie všetkých bločkov.
+    if count == 1 and max_width > 0.85:
+        score -= 700
+
+    # Extrémne pokrytie celej stránky je podozrivé.
+    if coverage > 0.95:
+        score -= 500
+
+    # Príliš úzke fragmenty sú skôr šum.
+    if any(w / page_width < 0.08 for w in widths):
+        score -= 300
+
+    return score
+
+
+
+def _merge_close_intervals(intervals, max_gap):
+    if not intervals:
+        return []
+    intervals = sorted(intervals)
+    merged = [list(intervals[0])]
+    for start, end in intervals[1:]:
+        if start - merged[-1][1] <= max_gap:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(a, b) for a, b in merged]
+
+
+def _split_box_by_seams(page_img, box):
+    """
+    Fallback pre prípad, keď predchádzajúca detekcia spojí viac bločkov do jedného širokého rámika.
+    Hľadá výrazné vertikálne švy/gapy medzi bločkami:
+    - tmavý zvislý tieň medzi papiermi,
+    - alebo svetlý/nízko-textový gap medzi dokladmi.
+    Používa sa iba pri jednom veľmi širokom boxe.
+    """
+    x1, y1, x2, y2 = box
+    crop = page_img[y1:y2, x1:x2]
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    if w < 300 or h < 300:
+        return [box]
+
+    # Švy hľadáme v strednej vertikálnej časti dokladu, nie v úplnom hornom/spodnom okraji.
+    y_top = int(h * 0.12)
+    y_bottom = int(h * 0.88)
+    band = gray[y_top:y_bottom, :]
+
+    col_mean = band.mean(axis=0)
+    k = max(31, int(w * 0.025))
+    if k % 2 == 0:
+        k += 1
+    smooth_mean = np.convolve(col_mean, np.ones(k) / k, mode="same")
+
+    # 1) Kandidáti na tmavý vertikálny šev: lokálne minimum jasu.
+    median_val = float(np.median(smooth_mean))
+    dark_limit = median_val - 8.0
+    dark_active = smooth_mean < dark_limit
+
+    # 2) Kandidáti na svetlý gap bez textu: nízky výskyt tmavých pixelov.
+    ink = (band < 175).astype(np.uint8).mean(axis=0)
+    smooth_ink = np.convolve(ink, np.ones(k) / k, mode="same")
+    ink_limit = max(0.015, float(np.percentile(smooth_ink, 12)))
+    light_gap_active = smooth_ink < ink_limit
+
+    candidates = []
+    min_gap_width = max(8, int(w * 0.008))
+    for active, typ in [(dark_active, "dark"), (light_gap_active, "light")]:
+        intervals = _find_intervals(active, min_width=min_gap_width)
+        for a, b in intervals:
+            center = (a + b) // 2
+            # Neberieme okraje, iba vnútorné deliace miesta.
+            if center < w * 0.18 or center > w * 0.82:
+                continue
+            left_mean = float(np.mean(smooth_mean[max(0, center - 90):max(1, center - 30)]))
+            right_mean = float(np.mean(smooth_mean[min(w, center + 30):min(w, center + 90)]))
+            seam_mean = float(np.mean(smooth_mean[a:b + 1]))
+            contrast = ((left_mean + right_mean) / 2.0) - seam_mean
+            candidates.append((contrast, a, b, center, typ))
+
+    # Vyberieme iba silné švy. Pre bledé fotky sú rozdiely malé, preto je limit mierny.
+    split_points = []
+    for contrast, a, b, center, typ in sorted(candidates, reverse=True):
+        if typ == "dark" and contrast < 6.0:
+            continue
+        # Svetlý gap nemusí mať kontrast v jase; overujeme skôr nízky ink.
+        if typ == "light" and smooth_ink[center] > 0.025:
+            continue
+        if any(abs(center - p) < w * 0.07 for p in split_points):
+            continue
+        split_points.append(center)
+
+    split_points = sorted(split_points)
+    if not split_points:
+        return [box]
+
+    # Nenecháme vyrobiť príliš úzke fragmenty.
+    points = [0] + split_points + [w]
+    min_part_width = int(w * 0.22)
+    parts = []
+    for a, b in zip(points[:-1], points[1:]):
+        if b - a >= min_part_width:
+            parts.append((x1 + a, y1, x1 + b, y2))
+
+    return parts if len(parts) >= 2 else [box]
+
+
+def _paper_region_boxes(page_img):
+    """
+    Detekcia podľa svetlej plochy papiera. Je určená hlavne pre fotky bločkov na tmavšom
+    podklade. Pri klasickom PDF skene na bielom pozadí často vráti celú stranu, preto sa
+    používa len ako doplnkový kandidát.
+    """
+    gray = cv2.cvtColor(page_img, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+
+    candidate_boxes = []
+    # Skúsime viac prahov. Pri bledých termo bločkoch býva papier len o trochu svetlejší.
+    for threshold in [205, 198, 190, 180]:
+        mask = (gray > threshold).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, w // 90), max(9, h // 120)))
+        clean = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        clean = cv2.morphologyEx(clean, cv2.MORPH_OPEN, kernel, iterations=1)
+        contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for c in contours:
+            x, y, bw, bh = cv2.boundingRect(c)
+            area = bw * bh
+            if area < w * h * 0.07:
+                continue
+            if bw < w * 0.18 or bh < h * 0.25:
+                continue
+            # Celú stranu ignorujeme, to nie je užitočné rozdelenie.
+            if bw > w * 0.92 and bh > h * 0.80:
+                continue
+            pad_x = int(bw * 0.025)
+            pad_y = int(bh * 0.025)
+            boxes.append((max(0, x - pad_x), max(0, y - pad_y), min(w, x + bw + pad_x), min(h, y + bh + pad_y)))
+        if len(boxes) >= 2:
+            candidate_boxes.extend(boxes)
+            break
+
+    if not candidate_boxes:
+        return []
+
+    # Dedup/merge podobných boxov podľa x pozície.
+    candidate_boxes = sorted(candidate_boxes, key=lambda b: (b[0], b[1]))
+    filtered = []
+    for box in candidate_boxes:
+        x1, y1, x2, y2 = box
+        duplicate = False
+        for fx1, fy1, fx2, fy2 in filtered:
+            inter_x1, inter_y1 = max(x1, fx1), max(y1, fy1)
+            inter_x2, inter_y2 = min(x2, fx2), min(y2, fy2)
+            inter = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+            area = (x2 - x1) * (y2 - y1)
+            farea = (fx2 - fx1) * (fy2 - fy1)
+            if inter / max(1, min(area, farea)) > 0.70:
+                duplicate = True
+                break
+        if not duplicate:
+            filtered.append(box)
+    return filtered
+
+
+def _boxes_score(boxes, page_w, page_h):
+    if not boxes:
+        return -10000
+    count = len(boxes)
+    widths = [(x2 - x1) / page_w for x1, y1, x2, y2 in boxes]
+    heights = [(y2 - y1) / page_h for x1, y1, x2, y2 in boxes]
+    score = 0
+    if 2 <= count <= 12:
+        score += 1200 + 80 * count
+    elif count == 1:
+        score += 100
+    else:
+        score -= 300
+    if count == 1 and widths[0] > 0.85:
+        score -= 800
+    if any(w < 0.12 for w in widths):
+        score -= 250
+    if any(h < 0.20 for h in heights):
+        score -= 150
+    return score
+
+
+
+def _trim_box_to_bright_paper(page_img, box):
+    """Oreže zvislý rozsah boxu podľa svetlej plochy papiera. Pomáha pri JPG fotkách na podklade."""
+    x1, y1, x2, y2 = box
+    crop = page_img[y1:y2, x1:x2]
+    if crop.size == 0:
+        return box
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    best_active = None
+    for threshold in [200, 190, 180]:
+        bright_frac = (gray > threshold).mean(axis=1)
+        k = max(21, int(h * 0.015))
+        if k % 2 == 0:
+            k += 1
+        smooth = np.convolve(bright_frac, np.ones(k) / k, mode="same")
+        active = np.where(smooth > 0.30)[0]
+        if len(active) > h * 0.30:
+            best_active = active
+            break
+    if best_active is None:
+        return box
+    pad = int(h * 0.025)
+    ny1 = max(y1, y1 + int(best_active[0]) - pad)
+    ny2 = min(y2, y1 + int(best_active[-1]) + pad)
+    if ny2 - ny1 < (y2 - y1) * 0.25:
+        return box
+    return (x1, ny1, x2, ny2)
+
+
+def _expand_boxes_to_column_gaps(boxes, page_w, page_h):
+    """
+    Rozšíri OCR výrezy do bočných medzier medzi bločkami.
+
+    Dôležité pre PDF skeny ako Hornbach: projekčná detekcia nájde najmä textový stĺpec,
+    ale ceny a DPH stĺpce bývajú úplne vpravo. Bez rozšírenia sa odsekne pravá časť
+    bločku a OCR potom vidí napr. 87,1 namiesto 87,62 alebo len základ bez DPH.
+    """
+    if len(boxes) < 2:
+        return boxes
+
+    boxes = sorted(boxes, key=lambda b: (b[0], b[1]))
+    expanded = []
+    for i, box in enumerate(boxes):
+        x1, y1, x2, y2 = box
+
+        if i == 0:
+            nx1 = 0
+        else:
+            prev_x2 = boxes[i - 1][2]
+            gap_left = max(0, x1 - prev_x2)
+            # Necháme len malý bezpečnostný odstup od predchádzajúceho textového stĺpca.
+            nx1 = max(0, prev_x2 + int(gap_left * 0.08))
+
+        if i == len(boxes) - 1:
+            nx2 = page_w
+        else:
+            next_x1 = boxes[i + 1][0]
+            gap_right = max(0, next_x1 - x2)
+            # Do výrezu zoberieme takmer celú pravú medzeru, aby sa neodrezali ceny.
+            nx2 = min(page_w, next_x1 - int(gap_right * 0.08))
+
+        # Zvislo mierne rozšírime, ale nepúšťame výrez mimo strany.
+        pad_y = int(page_h * 0.01)
+        ny1 = max(0, y1 - pad_y)
+        ny2 = min(page_h, y2 + pad_y)
+
+        # Bezpečnostná kontrola: ak by rozšírenie spravilo nezmyselne úzky box, necháme pôvodný.
+        if nx2 - nx1 >= max(80, (x2 - x1) * 0.75):
+            expanded.append((nx1, ny1, nx2, ny2))
+        else:
+            expanded.append(box)
+
+    return expanded
+
+
+def _boxes_are_fragmented(boxes, page_w, page_h):
+    """Heuristika: zistí, či sú boxy skôr fragmenty jedného/dvoch bločkov než celé bločky."""
+    if len(boxes) <= 1:
+        return True
+    # Ak existujú boxy v rovnakom x pásme, ale s výrazne odlišným y rozsahom, ide často o fragmentáciu.
+    for i, a in enumerate(boxes):
+        ax1, ay1, ax2, ay2 = a
+        for b in boxes[i + 1:]:
+            bx1, by1, bx2, by2 = b
+            overlap_x = max(0, min(ax2, bx2) - max(ax1, bx1))
+            min_w = max(1, min(ax2 - ax1, bx2 - bx1))
+            same_column = overlap_x / min_w > 0.45
+            vertical_gap_or_overlap = abs(ay1 - by1) > page_h * 0.15 or abs(ay2 - by2) > page_h * 0.15
+            if same_column and vertical_gap_or_overlap:
+                return True
+    # Ak jeden box má výšku výrazne menšiu než ostatné, býva to horný/spodný fragment.
+    heights = [(y2 - y1) / page_h for x1, y1, x2, y2 in boxes]
+    if min(heights) < 0.32 and max(heights) > 0.55:
+        return True
+
+    # Ak sú šírky veľmi nerovnomerné, často ide o rozbitý pravý/ľavý blok.
+    widths = [(x2 - x1) / page_w for x1, y1, x2, y2 in boxes]
+    if len(widths) >= 3 and min(widths) < 0.18 and (max(widths) / max(min(widths), 0.001)) > 1.75:
+        return True
+
+    return False
+
+
+def detect_receipts(page_img):
+    """
+    Detekcia bločkov v8:
+    1. vertikálna projekcia tmavého textu/okrajov,
+    2. detekcia svetlej plochy papiera pre fotky na tmavšom pozadí,
+    3. fallback rozdelenie jedného veľkého boxu podľa zvislého švu/gapu.
+    """
+    rgb = page_img.copy()
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+
+    candidate_sets = []
+
+    parameter_sets = [
+        (170, 0.045, 0.012, 0.10),
+        (180, 0.050, 0.012, 0.10),
+        (190, 0.065, 0.012, 0.10),
+        (200, 0.090, 0.014, 0.10),
+        (220, 0.075, 0.020, 0.10),
+    ]
+
+    for params in parameter_sets:
+        intervals, mask = _projection_boxes(
+            gray,
+            dark_limit=params[0],
+            active_threshold=params[1],
+            smooth_frac=params[2],
+            min_width_frac=params[3],
+        )
+        if not intervals:
+            continue
+        boxes = []
+        x_pad = int(w * 0.012)
+        y_pad = int(h * 0.025)
+        for x_start, x_end in intervals:
+            x1 = max(0, x_start - x_pad)
+            x2 = min(w, x_end + x_pad)
+            crop_mask = mask[:, x1:x2]
+            row_projection = crop_mask.mean(axis=1)
+            row_kernel = max(31, int(h * 0.012))
+            if row_kernel % 2 == 0:
+                row_kernel += 1
+            row_smooth = np.convolve(row_projection, np.ones(row_kernel) / row_kernel, mode="same")
+            y_active = np.where(row_smooth > 0.006)[0]
+            if len(y_active) == 0:
+                y1, y2 = 0, h
+            else:
+                y1 = max(0, int(y_active[0]) - y_pad)
+                y2 = min(h, int(y_active[-1]) + y_pad)
+            boxes.append((x1, y1, x2, y2))
+        # Ak je to jeden veľký box, pokúsime sa ho rozrezať podľa švu.
+        if len(boxes) == 1 and (boxes[0][2] - boxes[0][0]) > w * 0.75:
+            boxes = _split_box_by_seams(page_img, boxes[0])
+        candidate_sets.append((boxes, _boxes_score(boxes, w, h), f"projection {params}"))
+
+    paper_boxes = _paper_region_boxes(page_img)
+    if paper_boxes:
+        split_paper = []
+        for box in paper_boxes:
+            if (box[2] - box[0]) > w * 0.75:
+                split_paper.extend(_split_box_by_seams(page_img, box))
+            else:
+                split_paper.append(box)
+        candidate_sets.append((split_paper, _boxes_score(split_paper, w, h) + 100, "paper"))
+
+    if not candidate_sets:
+        return [(0, 0, w, h)]
+
+    candidate_sets.sort(key=lambda item: item[1], reverse=True)
+    boxes = sorted(candidate_sets[0][0], key=lambda b: (b[0], b[1]))
+
+    # Finálna kontrola: ak aj víťaz je jeden široký box, ešte raz skúsime split.
+    if len(boxes) == 1 and (boxes[0][2] - boxes[0][0]) > w * 0.75:
+        boxes = _split_box_by_seams(page_img, boxes[0])
+
+    # Ak výsledok vyzerá ako fragmenty (napr. bledý JPG rozdelený na horný/spodný kus),
+    # skúsime rozdeliť celú stránku podľa centrálneho švu.
+    full_split = _split_box_by_seams(page_img, (0, 0, w, h))
+    if len(full_split) >= 2 and (_boxes_are_fragmented(boxes, w, h) or len(boxes) == 1):
+        trimmed = [_trim_box_to_bright_paper(page_img, b) for b in full_split]
+        if _boxes_score(trimmed, w, h) >= _boxes_score(boxes, w, h) - 150:
+            boxes = trimmed
+
+    boxes = _expand_boxes_to_column_gaps(boxes, w, h)
+
+    return sorted(boxes, key=lambda b: (b[0], b[1]))
+
+
+def preprocess_for_ocr(img):
+    # Ponechané kvôli kompatibilite. Hlavný OCR používa generate_ocr_variants().
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    gray = cv2.resize(gray, None, fx=2.2, fy=2.2, interpolation=cv2.INTER_CUBIC)
+    processed = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11,
+    )
+    return processed
+
+
+def _unsharp(gray):
+    blur = cv2.GaussianBlur(gray, (0, 0), 1.2)
+    return cv2.addWeighted(gray, 1.7, blur, -0.7, 0)
+
+
+def _resize_for_ocr(gray):
+    """
+    Zmenší príliš veľké výrezy pred Tesseractom a malé výrezy mierne zväčší.
+    Telefónové JPG výrezy bývajú zbytočne veľké; OCR je potom pomalé bez lepšej presnosti.
+    """
+    h, w = gray.shape[:2]
+    long_side = max(h, w)
+    short_side = min(h, w)
+
+    max_long_side = int(CONFIG.get("ocr_max_long_side", 2200) or 0)
+    min_short_side = int(CONFIG.get("ocr_min_short_side", 900) or 0)
+
+    scale = 1.0
+    if max_long_side > 0 and long_side > max_long_side:
+        scale = min(scale, max_long_side / float(long_side))
+    if min_short_side > 0 and short_side < min_short_side:
+        scale = max(scale, min_short_side / float(short_side))
+
+    if max_long_side > 0 and long_side * scale > max_long_side * 1.15:
+        scale = max_long_side / float(long_side)
+
+    if abs(scale - 1.0) < 0.03:
+        return gray
+
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+    return cv2.resize(gray, None, fx=scale, fy=scale, interpolation=interpolation)
+
+
+def generate_ocr_variants(img):
+    """
+    Primárny OCR variant je sivý obraz so smart resize.
+    Agresívne thresholdovanie tu zámerne nerobíme, lebo pri bledých termo bločkoch vie zmazať čísla.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    gray = _resize_for_ocr(gray)
+    return [("gray", gray)]
+
+
+def _ocr_score(text):
+    norm = _normalize_text(text)
+    score = 0
+    money_count = len(re.findall(r"\d{1,6}\s*[,.]\s*\d{1,2}", text))
+    score += money_count * 8
+    for token, points in [
+        ("dph", 20), ("zaklad", 18), ("dan", 16), ("obrat", 16),
+        ("cena celkom", 25), ("hotovost", 20), ("karta", 20),
+        ("na uhradu", 25), ("doklad", 12), ("datum", 12),
+        ("zaokruhlenie", 14), ("rozpis platie", 12),
+    ]:
+        if token in norm:
+            score += points
+    # Príliš dlhý šum bez čísel nechceme preferovať.
+    score += min(len(text), 2000) / 200
+    return score
+
+
+def _ocr_feature_summary(text):
+    norm = _normalize_text(text)
+    money_count = len(re.findall(r"\d{1,6}\s*[,.]\s*\d{1,2}", text))
+    has_date = bool(re.search(r"\b\d{1,2}[.\/-]\s*\d{1,2}[.\/-]\s*\d{2,4}\b", text))
+    has_total_keyword = any(token in norm for token in [
+        "cena celkom", "hotovost", "hotovosť", "karta", "na uhradu", "na úhradu", "ciastka", "čiastka"
+    ])
+    has_vat_keyword = any(token in norm for token in [
+        "dph", "zaklad", "základ", "dan", "daň", "obrat", "23%", "23 %"
+    ])
+    return {
+        "score": _ocr_score(text),
+        "money_count": money_count,
+        "has_date": has_date,
+        "has_total_keyword": has_total_keyword,
+        "has_vat_keyword": has_vat_keyword,
+    }
+
+
+def _fast_ocr_is_sufficient(text):
+    if not text or not text.strip():
+        return False
+
+    features = _ocr_feature_summary(text)
+    min_score = float(CONFIG.get("ocr_fast_accept_min_score", 95))
+    min_money = int(CONFIG.get("ocr_fast_accept_min_money_count", 3))
+    require_date_or_total = bool(CONFIG.get("ocr_fast_accept_require_date_or_total_keyword", True))
+
+    if features["score"] < min_score:
+        return False
+    if features["money_count"] < min_money:
+        return False
+    if not features["has_vat_keyword"]:
+        return False
+    if require_date_or_total and not (features["has_date"] or features["has_total_keyword"]):
+        return False
+    return True
+
+
+def _parsed_text_has_key_fields(text):
+    """
+    Rýchla interná kontrola, či už OCR text obsahuje kľúčové sumy.
+    Umožní zastaviť rozšírený OCR režim skôr ako prebehne všetkých 7 Tesseract volaní.
+    """
+    if not text or not text.strip():
+        return False
+    try:
+        row = parse_receipt_text(text, 0, "__ocr_check__")
+    except Exception:
+        return False
+
+    total = row.get("Suma na úhradu") not in ("", None) or row.get("Spolu s DPH") not in ("", None)
+    dph = row.get("DPH") not in ("", None)
+    zaklad = row.get("Základ DPH") not in ("", None)
+    obrat = row.get("Obrat DPH") not in ("", None)
+    date = bool(row.get("Dátum vystavenia"))
+
+    # Pri hotovostnej platbe s výdavkom vie rýchly OCR zameniť prijatú hotovosť za sumu dokladu
+    # alebo zle prečítať riadok CELKOM. Vtedy rýchly režim nepovažujeme za dostatočný
+    # a pustíme rozšírený OCR.
+    norm_text = _normalize_text(text)
+    payment_source_norm = _normalize_text(str(row.get("Zdroj sumy na úhradu", "")))
+    if any(tok in norm_text for tok in ["vratene", "vraten", "vydavok", "vydane"]) and any(tok in payment_source_norm for tok in ["hotovost", "hotovosf"]):
+        return False
+
+    if total and dph and (obrat or zaklad):
+        return True
+    if total and date and (dph or obrat or zaklad):
+        return True
+    return False
+
+
+def run_ocr(img):
+    """
+    Optimalizovaný OCR režim v18:
+    - obrázky sa pred Tesseractom rozumne zmenšia/zväčšia,
+    - najprv ide rýchly OCR,
+    - rozšírený/faint OCR beží progresívne a zastaví sa hneď, keď parser nájde kľúčové údaje,
+    - maximálny počet faint volaní sa dá obmedziť cez config: ocr_faint_max_calls.
+    """
+    ocr_results = []
+    ocr_t0 = time.perf_counter()
+    calls = 0
+
+    def combine_results(limit=8):
+        if not ocr_results:
+            return ""
+        ocr_results.sort(reverse=True, key=lambda item: item[0])
+        combined_parts = []
+        seen_lines = set()
+        for score, label, text in ocr_results[:limit]:
+            combined_parts.append(f"\n--- OCR pokus {label}, score={score:.1f} ---")
+            for line in text.splitlines():
+                clean = line.strip()
+                if not clean:
+                    continue
+                key = re.sub(r"\s+", " ", clean.lower())
+                if key in seen_lines:
+                    continue
+                seen_lines.add(key)
+                combined_parts.append(clean)
+        return "\n".join(combined_parts).strip()
+
+    def should_stop_progressively():
+        if not bool(CONFIG.get("ocr_progressive_stop", True)):
+            return False
+        return _parsed_text_has_key_fields(combine_results(limit=8))
+
+    def run_one(part_img, label, psm):
+        nonlocal calls
+        variants = dict(generate_ocr_variants(part_img))
+        processed = variants.get("gray")
+        if processed is None:
+            return False
+
+        timeout = int(CONFIG.get("tesseract_timeout_seconds", 12))
+        primary_lang = str(CONFIG.get("ocr_language", "slk+eng") or "slk+eng")
+        fallback_lang = str(CONFIG.get("ocr_fallback_language", "eng") or "").strip()
+        config = f"--oem 3 --psm {psm}"
+        calls += 1
+
+        try:
+            text = pytesseract.image_to_string(processed, lang=primary_lang, config=config, timeout=timeout)
+        except RuntimeError:
+            text = ""
+        except Exception:
+            text = ""
+
+        if not text.strip() and fallback_lang:
+            try:
+                text = pytesseract.image_to_string(processed, lang=fallback_lang, config=config, timeout=timeout)
+            except Exception:
+                text = ""
+
+        if text.strip():
+            ocr_results.append((_ocr_score(text), f"{label}:gray:psm{psm}", text))
+
+        return should_stop_progressively()
+
+    h, w = img.shape[:2]
+    gray0 = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    faint_mode = str(CONFIG.get("faint_scan_mode", "auto")).strip().lower()
+    if faint_mode == "always":
+        faint = True
+    elif faint_mode in {"off", "false", "0", "disabled"}:
+        faint = False
+    else:
+        faint = (float(np.percentile(gray0, 95)) < 240) or (float(np.median(gray0)) < 230)
+
+    if bool(CONFIG.get("ocr_fast_first", True)):
+        stopped = run_one(img, "fast_full", 6)
+        fast_text = combine_results(limit=3)
+        # v20: rýchly OCR prijmeme iba vtedy, keď parser z neho vie vytiahnuť kľúčové sumy.
+        # Staršie pravidlo stačilo na score textu, ale pri svetlých bločkoch vedelo prijať text,
+        # v ktorom bola úhrada, no chýbal DPH riadok.
+        require_parsed_fast = bool(CONFIG.get("ocr_fast_require_parsed_fields", True))
+        fast_ok = _fast_ocr_is_sufficient(fast_text)
+        parsed_ok = stopped or _parsed_text_has_key_fields(fast_text)
+        if fast_text and faint_mode != "always" and ((require_parsed_fast and parsed_ok) or ((not require_parsed_fast) and fast_ok)):
+            if timing_enabled():
+                log_time(f"OCR rýchly prijatý ({calls} volanie Tesseract)", time.perf_counter() - ocr_t0, indent=8)
+            return fast_text
+
+    max_calls = int(CONFIG.get("ocr_faint_max_calls", 5) or 0)
+
+    def call_allowed():
+        return max_calls <= 0 or calls < max_calls
+
+    if faint or faint_mode == "always":
+        stages = [(img, "full", 4)]
+        payband = img[int(h * 0.36):int(h * 0.84), :]
+        if payband.size:
+            stages.append((payband, "payband", 6))
+        dphtable = img[int(h * 0.43):int(h * 0.75), :]
+        if dphtable.size:
+            stages.append((dphtable, "dphtable", 6))
+        topband = img[0:int(h * 0.48), :]
+        if topband.size:
+            stages.append((topband, "topband", 6))
+        if dphtable.size:
+            stages.append((dphtable, "dphtable", 4))
+        if topband.size:
+            stages.append((topband, "topband", 4))
+
+        for part_img, label, psm in stages:
+            if not call_allowed():
+                break
+            if run_one(part_img, label, psm):
+                break
+    else:
+        stages = [(img, "full", 4)]
+        lowerband = img[int(h * 0.35):, :]
+        if lowerband.size:
+            stages.append((lowerband, "lowerband", 6))
+        for part_img, label, psm in stages:
+            if run_one(part_img, label, psm):
+                break
+
+    combined = combine_results(limit=8)
+    if timing_enabled():
+        label = "OCR faint/rozšírený" if (faint or faint_mode == "always") else "OCR rozšírený"
+        log_time(f"{label} ({calls} volaní Tesseract)", time.perf_counter() - ocr_t0, indent=8)
+    return combined
+
+def _is_debug_line(line: str) -> bool:
+    return line.strip().lower().startswith("--- ocr pokus")
+
+def parse_money_values(line):
+    """
+    Vráti peňažné hodnoty z riadku.
+    Podporuje 12,34; 12.34; 12, 34; 12. 34; -0,01; +0,02; aj OCR zápis 2,3 => 2,30.
+    Novšie doplnenie: opravuje niektoré OCR chyby v číslach, napr. b,10 -> 6,10
+    a 17.234 -> 17,23, čo sa často objavuje na svetlých termo bločkoch.
+    Debug riadky OCR sa ignorujú, aby score=150.7 nebolo brané ako suma.
+    """
+    if _is_debug_line(line):
+        return []
+
+    # Normalizácia typografických mínusov a častých OCR oddeľovačov.
+    line = line.replace("−", "-").replace("–", "-").replace("—", "-")
+
+    values = []
+    seen = set()
+
+    def add_value(sign, euros, cents):
+        # Ak Tesseract prilepí k centom ešte jeden znak z kódu sadzby/meny, vezmeme prvé 2 číslice.
+        if len(cents) > 2:
+            cents = cents[:2]
+        if len(cents) == 1:
+            cents = cents + "0"
+        try:
+            value = float(f"{int(euros)}.{cents}")
+            if sign == "-":
+                value = -value
+            key = round(value, 2)
+            if key not in seen:
+                seen.add(key)
+                values.append(value)
+        except ValueError:
+            pass
+
+    # Ešte pred bežným regexom opravíme najčastejšie jednopísmenové celé časti sumy,
+    # aby sa zachovalo poradie hodnôt v riadku: 25,33 b,10 32,63 -> 25,33 6,10 32,63.
+    line_num = re.sub(r"(?<![A-Za-z0-9])b\s*([,.]\s*\d{1,3})(?![A-Za-z0-9])", r"6\1", line)
+    line_num = re.sub(r"(?<![A-Za-z0-9])[OoQqDd]\s*([,.]\s*\d{1,3})(?![A-Za-z0-9])", r"0\1", line_num)
+    line_num = re.sub(r"(?<![A-Za-z0-9])[Il|]\s*([,.]\s*\d{1,3})(?![A-Za-z0-9])", r"1\1", line_num)
+
+    # Bežné hodnoty: 12,34 / 12.34 / 12, 34. Tolerujeme aj 3 centové znaky, napr. 17.234 -> 17.23.
+    pattern = r"(?<!\d)([-+]?)\s*(\d{1,6})\s*[,.]\s*(\d{1,3})(?!\d)"
+    for sign, euros, cents in re.findall(pattern, line_num):
+        add_value(sign, euros, cents)
+
+    # Fuzzy OCR hodnoty: b,10 -> 6,10; O,00 -> 0,00; I,61 -> 1,61.
+    # Používame to najmä pri DPH riadkoch svetlých bločkov.
+    ocr_digit_map = str.maketrans({
+        "O": "0", "o": "0", "Q": "0", "q": "0", "D": "0", "d": "0",
+        "I": "1", "l": "1", "|": "1",
+        "S": "5", "s": "5",
+        "b": "6", "G": "6", "g": "6",
+        "B": "8",
+        "A": "4",
+    })
+    fuzzy_pattern = r"(?<![A-Za-z0-9])([-+]?)\s*([0-9OoQqDdIl|SsBbGgA]{1,6})\s*[,.]\s*([0-9OoQqDdIl|SsBbGgA]{1,3})(?![A-Za-z0-9])"
+    for sign, euros_raw, cents_raw in re.findall(fuzzy_pattern, line):
+        euros = euros_raw.translate(ocr_digit_map)
+        cents = cents_raw.translate(ocr_digit_map)
+        if not euros.isdigit() or not cents.isdigit():
+            continue
+        add_value(sign, euros, cents)
+
+    return values
+
+def format_eur(value):
+    if value is None:
+        return ""
+    return round(float(value), 2)
+
+
+
+def find_date(text):
+    # Najčastejší prípad: 10-04-2026 alebo 10.04.2026.
+    # Pri bledých dokladoch OCR často pokazí znaky v dátume, napr. "02 OA. 2026".
+    patterns = [
+        r"\b(\d{1,2})\s*[.\/-]\s*(\d{1,2})\s*[.\/-]\s*(\d{4})\b",
+        r"\b(\d{1,2})\s*[.\/-]\s*(\d{1,2})\s*[.\/-]\s*(\d{2})\b",
+        r"\b(\d{1,2})\s+(\d{1,2})\s*[.,\/-]\s*(\d{4})\b",
+    ]
+
+    regular_dates = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            day, month, year = match.groups()
+            try:
+                day_i = int(day)
+                month_i = int(month)
+            except ValueError:
+                continue
+            if not (1 <= day_i <= 31 and 1 <= month_i <= 12):
+                continue
+            if len(year) == 2:
+                year = "20" + year
+            regular_dates.append((match.start(), day_i, month_i, int(year), f"{day_i:02d}.{month_i:02d}.{int(year):04d}"))
+
+    # Fuzzy dátum z riadkov s nápisom Datum/Dátum: O->0, A->4, I/l->1, S->5, B->8.
+    fuzzy_map = str.maketrans({
+        "O": "0", "o": "0", "Q": "0", "D": "0",
+        "A": "4", "a": "4",
+        "I": "1", "l": "1", "|": "1",
+        "S": "5", "s": "5",
+        "B": "8",
+        "G": "6", "F": "6",
+    })
+    offset = 0
+    for raw_line in text.splitlines():
+        norm_line = _normalize_text(raw_line)
+        if any(tok in norm_line for tok in ["datum", "datun", "latum", "natum"]):
+            converted = raw_line.translate(fuzzy_map)
+            for match in re.finditer(r"\b(\d{1,2})[\s.\/-]+(\d{1,2})[\s.,\/-]+(\d{2,4})\b", converted):
+                day, month, year = match.groups()
+                try:
+                    day_i = int(day)
+                    month_i = int(month)
+                    year_i = int(year if len(year) == 4 else "20" + year)
+                except ValueError:
+                    continue
+                if 1 <= day_i <= 31 and 1 <= month_i <= 12 and 2020 <= year_i <= 2099:
+                    regular_dates.append((offset + match.start(), day_i, month_i, year_i, f"{day_i:02d}.{month_i:02d}.{year_i:04d}"))
+        offset += len(raw_line) + 1
+
+    compact_dates = []
+    # eKasa / číslo dokladu často obsahuje dátum YYMMDD na začiatku dlhšieho čísla.
+    # Pred hľadaním opravíme časté OCR chyby v číslach: F->6, O->0.
+    compact_text = text.translate(str.maketrans({"O": "0", "o": "0", "F": "6", "S": "5", "B": "8", "I": "1", "l": "1"}))
+    for match in re.finditer(r"(?<!\d)(2\d)([01]\d)([0-3]\d)\d{3,}(?!\d)", compact_text):
+        yy, mm, dd = match.groups()
+        year = 2000 + int(yy)
+        month_i = int(mm)
+        day_i = int(dd)
+        if 1 <= month_i <= 12 and 1 <= day_i <= 31:
+            compact_dates.append((match.start(), day_i, month_i, year, f"{day_i:02d}.{month_i:02d}.{year:04d}"))
+
+    # Ak OCR prečítalo napr. 02.04.2024, ale v eKasa čísle je 260402..., opravíme rok podľa eKasa.
+    for _, rd, rm, ry, rfmt in reversed(regular_dates):
+        for _, cd, cm, cy, cfmt in compact_dates:
+            if rd == cd and rm == cm and cy != ry:
+                return cfmt
+
+    if regular_dates:
+        regular_dates.sort(key=lambda item: item[0])
+        return regular_dates[-1][4]
+
+    if compact_dates:
+        compact_dates.sort(key=lambda item: item[0])
+        return compact_dates[0][4]
+
+    return ""
+
+def _all_money_counter(text):
+    values = []
+    for line in text.splitlines():
+        if _is_debug_line(line):
+            continue
+        values.extend(round(v, 2) for v in parse_money_values(line) if 0.01 <= abs(v) <= 100000)
+    return Counter(values)
+
+def _normalize_text(value: str) -> str:
+    """Zjednotí text pre robustnejšie hľadanie OCR výrazov."""
+    repl = str.maketrans({
+        "á": "a", "ä": "a", "č": "c", "ď": "d", "é": "e", "í": "i",
+        "ĺ": "l", "ľ": "l", "ň": "n", "ó": "o", "ô": "o", "ŕ": "r",
+        "š": "s", "ť": "t", "ú": "u", "ý": "y", "ž": "z",
+        "Á": "a", "Ä": "a", "Č": "c", "Ď": "d", "É": "e", "Í": "i",
+        "Ĺ": "l", "Ľ": "l", "Ň": "n", "Ó": "o", "Ô": "o", "Ŕ": "r",
+        "Š": "s", "Ť": "t", "Ú": "u", "Ý": "y", "Ž": "z",
+    })
+    value = value.translate(repl).lower()
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def find_payment_total(text):
+    """
+    Nájde sumu na úhradu priamo z platobných riadkov.
+    Pri bledých bločkoch sa hodnota často objaví v riadku Cena celkom alebo Hotovosť,
+    prípadne v nasledujúcom riadku. Fallback už neberie najväčšiu náhodnú OCR sumu.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not _is_debug_line(line)]
+    counts = _all_money_counter(text)
+
+    keyword_weights = [
+        ("ciastka eur", 180), ("ciastka:", 180), ("ciastka", 170), ("clastka", 160), ("ciastka, eur", 170),
+        ("na uhradu", 155), ("na ohradu", 150), ("nauhradu", 150), ("naohradu", 150),
+        ("uhradu eur", 150), ("ohradu eur", 145),
+        ("cena celkom", 145), ("cena celkom:", 150), ("lena cel", 115),
+        ("celkom:", 135), ("celkom", 125), ("clkom", 95), ("cekkom", 95), ("ceikom", 95),
+        ("sucet", 130), ("su cet", 120),
+        ("medzisucet", 110), ("medztsucet", 105), ("nedzisuce", 105),
+        ("karta", 100), ("kartou", 100),
+        # Hotovosť je slabší zdroj, lebo pri hotovostnej platbe s výdavkom označuje prijatú hotovosť, nie sumu dokladu.
+        ("hotovost", 82), ("hotovost:", 82), ("hotovosf", 75),
+        ("rozpis platie", 45),
+        ("spolu", 35), ("suma", 25),
+    ]
+
+    candidates = []
+    document_has_change = any(
+        any(tok in _normalize_text(line) for tok in ["vratene", "vraten", "vydavok", "vydane"])
+        for line in lines
+    )
+
+    def add_candidates_from_line(idx, line, base_weight, source_line):
+        values = [round(v, 2) for v in parse_money_values(line) if 0.10 <= abs(v) <= 100000]
+        for value in values:
+            if value <= 0:
+                continue
+            repeat_bonus = min(counts[value], 4) * 18
+            # Pri platbe je typicky posledná suma v riadku tá správna. Menší bonus pre pravýmost/posledný údaj.
+            last_bonus = 10 if values and value == values[-1] else 0
+            norm_source = _normalize_text(source_line)
+            score = base_weight + repeat_bonus + last_bonus
+
+            value_count = len(values)
+
+            # Ak existuje výdavok/vrátené, hotovosť je suma prijatá od zákazníka, nie suma dokladu.
+            if document_has_change and any(tok in norm_source for tok in ["hotovost", "hotovosf"]):
+                score -= 95
+
+            # Riadok Vrátené nikdy nie je suma dokladu.
+            if any(tok in norm_source for tok in ["vratene", "vraten", "vydavok", "vydane"]):
+                score -= 180
+
+            # Riadok CELKOM s jednou sumou je veľmi silný zdroj sumy dokladu.
+            # Riadok CELKOM s viacerými sumami býva naopak DPH rekapitulácia.
+            if any(tok in norm_source for tok in ["celkom", "clkom", "cekkom", "ceikom"]) and "cena celkom" not in norm_source:
+                if value_count == 1:
+                    score += 70
+                elif value_count >= 2:
+                    score -= 90
+
+            # Riadky s DPH rekapituláciou nie sú platobné riadky. Výnimka ostáva iba pre
+            # kartový slip Čiastka/Cena celkom/Na úhradu.
+            if any(tok in norm_source for tok in ["rekapitulacia", "sadzba", "zaklad", "zaktad", "dph", "oph", "bez dph", "bezdp h", "a 23", "23x", "23%"] ) and not any(tok in norm_source for tok in ["ciastka", "clastka", "cena celkom", "karta", "na uhradu", "sucet", "medzisucet"]):
+                score -= 140
+
+            # Hodnoty s jedným centovým znakom, napr. 11,9 alebo 87,1, sú často odrezaný OCR.
+            # Nevyhadzujeme ich úplne, ale uprednostníme plné hodnoty 11,98 / 87,62, ak existujú.
+            if re.search(r"\d{1,6}\s*[,.]\s*\d(?!\d)", source_line) and not re.search(r"\d{1,6}\s*[,.]\s*\d{2}(?!\d)", source_line):
+                score -= 35
+
+            candidates.append((score, value, source_line, idx))
+
+    for idx, line in enumerate(lines):
+        norm = _normalize_text(line)
+        weight = 0
+        for keyword, keyword_weight in keyword_weights:
+            if keyword in norm:
+                weight = max(weight, keyword_weight)
+        if weight == 0:
+            continue
+
+        add_candidates_from_line(idx, line, weight, line)
+
+        # Ak riadok obsahuje iba text Cena celkom/Hotovosť a suma je na ďalšom riadku alebo v ďalšom OCR fragmente.
+        if not parse_money_values(line):
+            for j in range(idx + 1, min(len(lines), idx + 3)):
+                add_candidates_from_line(j, lines[j], max(30, weight - 12), f"{line} | {lines[j]}")
+
+    if candidates:
+        candidates.sort(reverse=True, key=lambda item: item[0])
+        return candidates[0][1], candidates[0][2]
+
+    # Konzervatívny fallback: nevyberáme najväčšiu sumu, ale hodnoty s opakovaním alebo výskytom pri EUR.
+    fallback = []
+    for idx, line in enumerate(lines):
+        norm = _normalize_text(line)
+        if "eur" not in norm and "fur" not in norm and "evr" not in norm:
+            continue
+        if any(tok in norm for tok in ["rekapitulacia", "sadzba", "zaklad", "zaktad", "dph", "oph", "bez dph"]):
+            continue
+        for value in [round(v, 2) for v in parse_money_values(line) if 0.10 <= v <= 100000]:
+            # Preferuj opakované hodnoty a menšie reálne platobné sumy pred OCR halucináciami typu 2005.48.
+            score = min(counts[value], 4) * 20
+            if value < 1000:
+                score += 12
+            if value < 100:
+                score += 8
+            fallback.append((score, value, line, idx))
+    if fallback:
+        fallback.sort(reverse=True, key=lambda item: item[0])
+        if fallback[0][0] >= 20:
+            return fallback[0][1], fallback[0][2]
+
+    return None, ""
+
+def find_total(text):
+    """Spätná kompatibilita: total = suma na úhradu."""
+    total, _source = find_payment_total(text)
+    return total
+
+
+def _candidate_vat_pairs(values, total=None):
+    """
+    Z množiny súm v jednom riadku vygeneruje kandidátov na dvojicu základ + DPH.
+    Nepredpokladáme pevné pozície, lebo OCR často pridá alebo vynechá hodnotu.
+    """
+    values = [round(v, 2) for v in values if 0.01 <= v <= 100000]
+    candidates = []
+
+    # Najprv hľadáme priamu trojicu: základ, DPH, spolu.
+    if len(values) >= 3:
+        for i in range(len(values) - 2):
+            zaklad, dph, spolu = values[i], values[i + 1], values[i + 2]
+            if zaklad <= 0 or dph <= 0 or spolu <= 0:
+                continue
+            if zaklad < dph:
+                continue
+            if not (0.18 <= dph / zaklad <= 0.28):
+                continue
+            if abs((zaklad + dph) - spolu) > 0.06:
+                continue
+            if total is not None and abs(spolu - total) > 0.08:
+                continue
+            candidates.append((zaklad, dph, spolu, 100 - abs((zaklad + dph) - spolu)))
+
+    # Potom všetky dvojice: základ + DPH = suma na úhradu.
+    for i, zaklad in enumerate(values):
+        for j, dph in enumerate(values):
+            if i == j:
+                continue
+            if zaklad <= 0 or dph <= 0:
+                continue
+            if zaklad < dph:
+                continue
+            ratio = dph / zaklad
+            if not (0.18 <= ratio <= 0.28):
+                continue
+            computed_total = round(zaklad + dph, 2)
+            if total is not None and abs(computed_total - total) > 0.08:
+                continue
+            score = 80
+            if total is not None:
+                score += 20 - abs(computed_total - total)
+            candidates.append((zaklad, dph, computed_total, score))
+
+    return candidates
+
+
+
+def find_rounding_amount(text):
+    """Nájde zaokrúhlenie z riadkov typu Zaokrúhlenie / RND."""
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not _is_debug_line(line)]
+    candidates = []
+
+    def signed_values_from_rounding_line(line):
+        vals = [round(v, 2) for v in parse_money_values(line) if abs(v) <= 5]
+        if not vals:
+            return []
+        norm = line.replace("−", "-").replace("–", "-").replace("—", "-")
+        has_negative_hint = bool(re.search(r"[-]\s*0\s*[,.]\s*\d{1,2}", norm))
+        # OCR často prečíta mínus ako úvodzovku, zvislú čiaru alebo znak «.
+        if not has_negative_hint and re.search(r"[\"'`´“”|«‹]\s*0\s*[,.]\s*\d{1,2}", norm):
+            has_negative_hint = True
+        if has_negative_hint and vals[-1] > 0:
+            vals[-1] = -vals[-1]
+        return vals, has_negative_hint
+
+    for idx, line in enumerate(lines):
+        norm = _normalize_text(line)
+        if not any(token in norm for token in ["zaokruhlen", "zaokruhl", "zaokr", "rnd", "rno", "knu"]):
+            continue
+        result = signed_values_from_rounding_line(line)
+        if result:
+            values, neg_hint = result
+            value = values[-1]
+            # Hotovostné zaokrúhlenie býva malé. Hodnoty ako 0.81/0.91 sú skoro vždy OCR chyba z 0.01.
+            if abs(value) <= 0.05:
+                candidates.append((1 if neg_hint else 0, idx, value, line))
+            continue
+        if idx + 1 < len(lines):
+            nxt = lines[idx + 1]
+            result = signed_values_from_rounding_line(nxt)
+            if result:
+                values, neg_hint = result
+                value = values[-1]
+                if abs(value) <= 0.05:
+                    candidates.append((1 if neg_hint else 0, idx, value, f"{line} | {nxt}"))
+    if candidates:
+        # Ak existuje kandidát s jasným negatívnym znamienkom, preferujeme ho.
+        # Inak berieme posledný relevantný výskyt.
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        _neg, _idx, value, source = candidates[-1]
+        return value, source
+    return 0.0, ""
+
+def _extract_vat_line_candidates(line, total=None, rounding=0.0, prev_norm=""):
+    """
+    V9 pravidlo:
+    - DPH musí byť prečítaná z bloku.
+    - Pri riadku s 3 sumami čítame: základ, DPH/daň, obrat.
+    - Ak OCR neprečíta oficiálnu tabuľku, ako pomocný zdroj použijeme aj riadok Rekapitulácia obratu.
+    - Total môže byť chybný OCR fallback, preto kandidáta kvôli totalu nezahadzujeme, iba skórujeme.
+    """
+    if _is_debug_line(line):
+        return []
+    norm = _normalize_text(line)
+    values = [round(v, 2) for v in parse_money_values(line) if 0.00 <= abs(v) <= 100000]
+    if not values:
+        return []
+
+    vat_context = any(token in norm for token in [
+        "sadzba", "zaklad", "zaktad", "dph", "oph", "dan", "nan", "obrat", "23%", "23 %", "03%", "03 %", "2s%", "2s %", "a 23", "a23"
+    ])
+    if any(token in prev_norm for token in [
+        "sadzba", "zaklad", "zaktad", "dph", "oph", "dan", "nan", "obrat", "rekapitulacia obratu", "rekapitulacia"
+    ]):
+        vat_context = True
+    # DPH rekapitulácie majú často hlavičku na jednom riadku, riadok 23% a ďalší riadok CELKOM.
+    # Preto aj CELKOM po riadku so sadzbou 23% považujeme za DPH kontext.
+    if "celkom" in norm and ("23" in prev_norm or "%" in prev_norm):
+        vat_context = True
+    if re.search(r"\b(?:23|2s|2z|03|3)\s*%", line, re.IGNORECASE):
+        vat_context = True
+    if not vat_context:
+        return []
+
+    candidates = []
+
+    def add_candidate(zaklad, dph, obrat, source_note):
+        if zaklad is None or dph is None:
+            return
+        zaklad = round(float(zaklad), 2)
+        dph = round(float(dph), 2)
+        obrat = round(float(obrat if obrat is not None else zaklad + dph), 2)
+        if zaklad <= 0 or dph <= 0 or obrat <= 0:
+            return
+
+        # Rescue pre bledé bločky:
+        # OCR často pokazí prvú sumu v DPH tabuľke, napr. "23% 1.02 1.61 8.63",
+        # kde 1.02 má byť 7.02. DPH však nechávame výhradne z bloku.
+        # Opravíme iba základ: Základ = Obrat DPH - DPH, a iba ak obrat sedí na úhradu/zaokrúhlenie.
+        source_note_extra = ""
+        sum_diff = abs((zaklad + dph) - obrat)
+        if sum_diff > 0.08:
+            corrected_zaklad = round(obrat - dph, 2)
+            corrected_ratio = dph / corrected_zaklad if corrected_zaklad else 0
+            expected_total = round(obrat + (rounding or 0.0), 2)
+            total_supports_obrat = (
+                total is not None
+                and abs(float(total) - expected_total) <= max(0.10, abs(expected_total) * 0.01)
+            )
+            # Ak je platobný riadok zle zvolený ako prijatá hotovosť s výdavkom, total nemusí podporiť obrat.
+            # Pri silnom DPH kontexte a sadzbe okolo 23 % preto dovolíme opravu základu aj bez totalu.
+            strong_vat_context = vat_context and (
+                "23" in norm or "23" in prev_norm or "%" in norm or "%" in prev_norm
+                or "dph" in norm or "dph" in prev_norm or "dan" in norm or "dan" in prev_norm
+                or "zaklad" in norm or "zaklad" in prev_norm
+            )
+            ratio_supports_obrat = abs(corrected_ratio - 0.23) <= 0.045
+            if (
+                corrected_zaklad > 0
+                and corrected_zaklad >= dph
+                and 0.15 <= corrected_ratio <= 0.30
+                and (total_supports_obrat or (strong_vat_context and ratio_supports_obrat))
+            ):
+                zaklad = corrected_zaklad
+                source_note_extra = " | základ opravený podľa Obrat DPH - DPH, OCR základ bol poškodený"
+            else:
+                return
+
+        if zaklad < dph:
+            return
+        ratio = dph / zaklad if zaklad else 0
+        if not (0.15 <= ratio <= 0.30):
+            return
+        score = 100
+        if "obrat" in source_note:
+            score += 55
+        elif "základ a DPH" in source_note and len(values) >= 3:
+            # Ten istý riadok má tri hodnoty; dvojicu základ+DPH berieme až ako slabší fallback.
+            score -= 55
+        if "23" in norm or "23" in prev_norm:
+            score += 25
+        if "dph" in norm or "oph" in norm or "dan" in norm or "nan" in norm or "dph" in prev_norm or "dan" in prev_norm:
+            score += 18
+        if "zaklad" in norm or "zaktad" in norm or "zaklad" in prev_norm:
+            score += 12
+        if "obrat" in norm or "obrat" in prev_norm:
+            score += 12
+        if "rekapitulacia" in prev_norm or "rekapitulacia" in norm:
+            score += 5
+        score += max(0, 30 - abs(ratio - 0.23) * 550)
+        expected_total = round(obrat + (rounding or 0.0), 2)
+        if total is not None:
+            pay_diff = abs(expected_total - total)
+            if pay_diff <= 0.05:
+                score += 90
+            elif pay_diff <= 0.20:
+                score += 30
+            elif pay_diff > max(0.50, total * 0.05):
+                score -= 25
+        candidates.append({
+            "score": score,
+            "zaklad_dph": zaklad,
+            "dph": dph,
+            "obrat_dph": obrat,
+            "spolu_s_dph": round(total, 2) if total is not None else expected_total,
+            "ratio": ratio,
+            "source_line": line,
+            "source_note": f"{source_note}{source_note_extra}",
+        })
+
+    # Typický eKasa riadok: 23% 7.02 1.61 8.63 alebo 23% 39.36 9.05 48.41.
+    if len(values) >= 3:
+        # Skúsime poslednú trojicu aj všetky trojice, lebo OCR vie na začiatok pridať šumovú sumu.
+        for i in range(0, len(values) - 2):
+            add_candidate(values[i], values[i + 1], values[i + 2], "riadok obsahuje základ, DPH/daň a obrat")
+        add_candidate(values[-3], values[-2], values[-1], "riadok obsahuje základ, DPH/daň a obrat")
+
+    # Riadky typu "BEZ DPH / S DPH / DPH" môžu mať poradie základ, obrat, DPH.
+    # Ak jedna hodnota v riadku sedí na platobnú sumu/obrat a druhá vyzerá ako DPH,
+    # základ dopočítame ako obrat - DPH. DPH je stále prevzatá z bloku.
+    if len(values) >= 2 and total is not None:
+        target_obrat = round(float(total) - float(rounding or 0.0), 2)
+        for obrat_guess in values:
+            if abs(obrat_guess - target_obrat) > 0.08:
+                continue
+            for dph_guess in values:
+                if dph_guess == obrat_guess:
+                    continue
+                zaklad_guess = round(obrat_guess - dph_guess, 2)
+                if zaklad_guess > 0:
+                    add_candidate(zaklad_guess, dph_guess, obrat_guess, "riadok obsahuje obrat a DPH; základ opravený ako Obrat DPH - DPH")
+
+    # Hornbach a podobné: A 23% 29,11 6,69; tretia suma chýba, obrat je základ + DPH.
+    if len(values) >= 2:
+        for i in range(0, len(values) - 1):
+            zaklad_guess = values[i]
+            dph_guess = values[i + 1]
+            add_candidate(zaklad_guess, dph_guess, zaklad_guess + dph_guess, "riadok obsahuje základ a DPH")
+
+    # Fallback: ak je v riadku iba DPH a poznáme total/rounding, základ opravíme.
+    if len(values) == 1 and total is not None:
+        dph = values[-1]
+        obrat = round(total - (rounding or 0.0), 2)
+        zaklad = round(obrat - dph, 2)
+        add_candidate(zaklad, dph, obrat, "DPH z bloku, základ opravený podľa úhrady a zaokrúhlenia")
+
+    return candidates
+
+
+def _infer_item_discount_totals(text):
+    """
+    Pomocná heuristika pre bločky typu METRO: položka má cenu napr. 40,01 EUR
+    a hneď za ňou je zľava/normal -7,38 EUR. Čistý súčet 32,63 potom podporí
+    správny DPH obrat, aj keď riadok CELKOM OCR prečíta slabo.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not _is_debug_line(line)]
+    inferred = []
+    discount_tokens = ["zlava", "normal", "rabat", "discount", "bonus"]
+    admin_tokens = ["dph", "sadzba", "zaklad", "zaktad", "dan", "obrat", "hotovost", "vratene", "zaokruhlen"]
+
+    for idx, line in enumerate(lines):
+        norm = _normalize_text(line)
+        vals = [round(v, 2) for v in parse_money_values(line)]
+        discounts = [v for v in vals if v < 0]
+        if not discounts and not any(tok in norm for tok in discount_tokens):
+            continue
+        if not discounts:
+            continue
+        discount = sum(discounts)
+
+        item_total = None
+        # Hľadáme najbližší predchádzajúci riadok s položkovou celkovou cenou.
+        for prev in reversed(lines[max(0, idx - 5):idx]):
+            prev_norm = _normalize_text(prev)
+            if any(tok in prev_norm for tok in admin_tokens):
+                continue
+            pvals = [round(v, 2) for v in parse_money_values(prev) if v > 0]
+            if not pvals:
+                continue
+            # Pri riadku 19,4200 1 2,06 23% 40,01 € je správna cena posledná/väčšia hodnota.
+            item_total = max(pvals)
+            break
+
+        if item_total is not None:
+            net = round(item_total + discount, 2)
+            if 0.10 <= net <= 100000:
+                inferred.append(net)
+
+    # deduplikácia so zachovaním poradia
+    result = []
+    for value in inferred:
+        if not any(abs(value - existing) <= 0.001 for existing in result):
+            result.append(value)
+    return result
+
+def find_vat_table(text, total=None):
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not _is_debug_line(line)]
+
+    payment_total, payment_source = find_payment_total(text)
+    if payment_total is not None:
+        total = payment_total
+
+    rounding, rounding_source = find_rounding_amount(text)
+
+    best = {
+        "zaklad_dph": None,
+        "dph": None,
+        "obrat_dph": None,
+        "zaokruhlenie": rounding,
+        "spolu_s_dph": total,
+        "sadzba_dph": "",
+        "payment_total": total,
+        "payment_source": payment_source,
+        "rounding_source": rounding_source,
+        "vat_source": "",
+    }
+
+    candidate_rows = []
+    for idx, line in enumerate(lines):
+        prev_norm = _normalize_text(lines[idx - 1]) if idx > 0 else ""
+        for candidate in _extract_vat_line_candidates(line, total=total, rounding=rounding, prev_norm=prev_norm):
+            candidate_rows.append(candidate)
+
+    inferred_item_totals = _infer_item_discount_totals(text)
+    if inferred_item_totals:
+        for candidate in candidate_rows:
+            if any(abs(candidate.get("obrat_dph", 0) - inferred) <= 0.08 for inferred in inferred_item_totals):
+                candidate["score"] += 95
+                candidate["source_note"] = candidate.get("source_note", "") + " | obrat podporený súčtom položka + zľava"
+
+    if candidate_rows:
+        candidate_rows.sort(reverse=True, key=lambda item: item["score"])
+        selected = candidate_rows[0]
+
+        # Ak OCR vybral riadok Rekapitulácia obratu, posledná suma môže byť už zaokrúhlená platba.
+        # Obrat DPH preto opravíme podľa: obrat = suma na úhradu - zaokrúhlenie,
+        # ale iba vtedy, keď základ + DPH na takýto obrat sedí. DPH sa tým nedopočítava.
+        if total is not None and rounding is not None:
+            corrected_obrat = round(float(total) - float(rounding or 0.0), 2)
+            if abs((selected["zaklad_dph"] + selected["dph"]) - corrected_obrat) <= 0.08:
+                selected["obrat_dph"] = corrected_obrat
+
+        expected_total = round(selected["obrat_dph"] + (rounding or 0.0), 2)
+
+        # Ak suma na úhradu nebola nájdená alebo je zjavne OCR artefakt, opravíme ju podľa DPH tabuľky + zaokrúhlenia.
+        # DPH týmto nedopočítavame; DPH zostáva prečítaná z bloku.
+        total_is_bad = total is None or abs(float(total) - expected_total) > max(0.08, min(0.20, abs(expected_total) * 0.003))
+        payment_source_norm = _normalize_text(payment_source or "")
+        text_has_change = any(tok in _normalize_text(text) for tok in ["vratene", "vraten", "vydavok", "vydane"])
+        hotovost_with_change = text_has_change and any(tok in payment_source_norm for tok in ["hotovost", "hotovosf"])
+        has_direct_payment_source = any(tok in payment_source_norm for tok in [
+            "na uhradu", "cena celkom", "celkom", "karta", "ciastka", "clastka", "sucet", "medzisucet"
+        ])
+
+        # Ak bol ako úhrada omylom zvolený riadok Hotovosť a doklad má aj Vrátené,
+        # Hotovosť je len prijatá suma. Vtedy použijeme obrat z DPH tabuľky ako sumu dokladu
+        # (ekvivalent riadku CELKOM, ak ho OCR neprečítalo).
+        short_cent_payment_source = bool(
+            re.search(r"\d{1,6}\s*[,.]\s*\d(?!\d)", payment_source or "")
+            and not re.search(r"\d{1,6}\s*[,.]\s*\d{2}(?!\d)", payment_source or "")
+        )
+        celkom_payment_source = any(tok in payment_source_norm for tok in ["celkom", "clkom", "cekkom", "ceikom"])
+
+        if total_is_bad and hotovost_with_change:
+            total = selected["obrat_dph"]
+            payment_source = f"{payment_source} | hotovosť s výdavkom; suma dokladu opravená podľa Obrat DPH/CELKOM"
+        elif total_is_bad and short_cent_payment_source and celkom_payment_source:
+            total = selected["obrat_dph"]
+            payment_source = f"{payment_source} | neúplné centy v riadku CELKOM; suma opravená podľa Obrat DPH"
+        elif total_is_bad and not has_direct_payment_source:
+            total = expected_total
+            if payment_source:
+                payment_source = f"{payment_source} | úhrada opravená podľa Obrat DPH + zaokrúhlenie"
+            else:
+                payment_source = "úhrada odvodená z Obrat DPH + zaokrúhlenie, lebo platobný riadok OCR neprečítalo spoľahlivo"
+
+        best["zaklad_dph"] = selected["zaklad_dph"]
+        best["dph"] = selected["dph"]
+        best["obrat_dph"] = selected["obrat_dph"]
+        best["spolu_s_dph"] = round(total, 2) if total is not None else selected["obrat_dph"]
+        best["payment_total"] = round(total, 2) if total is not None else None
+        best["payment_source"] = payment_source
+        best["sadzba_dph"] = "23 %"
+        best["vat_source"] = (
+            f"DPH z bloku: {selected['source_line']} | {selected.get('source_note','')} | "
+            f"Obrat DPH={selected['obrat_dph']}, zaokrúhlenie={rounding}"
+        )
+        return best
+
+    if total is not None:
+        best["spolu_s_dph"] = round(total, 2)
+        best["payment_total"] = round(total, 2)
+        best["vat_source"] = "DPH sa nepodarilo prečítať z bloku – nedopočítané"
+
+    return best
+
+def find_largest_item(text, total=None):
+    """
+    Nájde najväčšiu položku, nie platobný/rekapitulačný riadok.
+
+    V bledých bločkoch Tesseract často prečíta platbu (Hotovosť, Cena celkom)
+    lepšie než riadky položiek. Preto sa položky vyhodnocujú stavovým parserom:
+    - riadok bez sumy sa môže stať názvom položky,
+    - nasledujúci riadok s množstvom/jednotkovou cenou/cenou sa spojí s týmto názvom,
+    - platby, DPH tabuľky, rekapitulácie a bodové riadky sa vylúčia,
+    - pri palivách sa normalizuje názov typu LPG ST (7), NATURAL 95 ST (3).
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    admin_tokens = [
+        "dph", "zaklad", "sadzba", "dan", "obrat", "rekapitulacia", "zaokruh",
+        "spolu", "celkom", "uhrad", "hotovost", "hotovosf", "vratene", "vraten", "vydavok", "vydane", "karta", "kartou",
+        "platba", "ciastka", "clastka", "medzisucet", "pokladnica", "pokladna",
+        "doklad", "datum", "datun", "duzp", "cas:", "ico", "ic dph", "dic", "kp:",
+        "cislo", "registracie", "drzitel", "drzitela", "meno",
+        "okp", "uid", "overte", "qr", "ekasa", "terminal", "clerk", "contactless",
+        "mastercard", "autoriz", "potvrdenka", "zakaznika", "uschovajte", "dakujeme",
+        "dakujem", "mohli", "bodov", "body", "prevadzka", "hlavna", "pezinok",
+        "vinicne", "hornbach", "galvaniho", "raca", "rozpis plat", "rozpis",
+        "fakturu", "uctenky", "nepouzit", "podmienok",
+    ]
+
+    # Hinty pre názvy položiek. Zoznam nie je uzavretý; slúži hlavne na palivá a časté OCR prípady.
+    item_hint_tokens = [
+        "lpg", "natural", "nafta", "diesel", "benzin", "benz",
+        "tmel", "plech", "lak", "pies", "krmivo", "aqua", "profil",
+        "sada", "kliest", "kliesti", "klesti", "kliešt", "konc",
+        "st(", "st (", "ks", "kus", "kg",
+    ]
+
+    unit_tokens_re = r"\b(l|ks|kus|kg|g|bal|balenie|m|m2|m3|ml|l\.)\b|\bx\b"
+    currency_noise_re = r"\b(eur|fur|eir|cur|cui|fike|fik|ats|bur)\b"
+
+    def has_admin(norm_line):
+        return any(token in norm_line for token in admin_tokens)
+
+    def has_item_hint(norm_line):
+        return any(token in norm_line for token in item_hint_tokens)
+
+    def clean_desc(value):
+        value = re.sub(r"\s+", " ", value).strip(" |;:-")
+        replacements = {
+            "FUR": "EUR", "EIR": "EUR", "CUR": "EUR", "CUI": "EUR",
+            "Fike": "EUR", "BUR": "EUR",
+        }
+        for src, dst in replacements.items():
+            value = value.replace(src, dst)
+        return value
+
+    def normalize_product_name(value):
+        """Vráti krajší názov pre známe položky, ak ho vie rozpoznať."""
+        norm = _normalize_text(value)
+
+        # Pravidlo pre položku, kde OCR často prilepí aj jednotkovú cenu / celkovú cenu.
+        # Do výstupu chceme ponechať len názov položky + množstvo/jednotku.
+        # Príklad očakávaného výstupu: "Sada klieští vr,konc 1 Kus".
+        if ("sada" in norm or "sala" in norm) and ("kliest" in norm or "kliesti" in norm or "klesti" in norm or "klies" in norm) and "konc" in norm:
+            qty_match = re.search(r"\b(\d{1,3})\s*(?:ks|kus)\b", norm)
+            qty = qty_match.group(1) if qty_match else "1"
+            return f"Sada klieští vr,konc {qty} Kus"
+
+        if "natural" in norm:
+            grade = "95" if "95" in norm else ""
+            # ST číslo býva v zátvorke alebo po ST/Sf/S1; OCR občas zamieňa T za f/1.
+            match = re.search(r"(?:st|sf|s1|sl|ol)\s*\(?\s*(\d{1,2})", norm)
+            suffix = f" ST ({match.group(1)})" if match else ""
+            return f"NATURAL {grade}{suffix}".strip()
+
+        if "lpg" in norm:
+            match = re.search(r"\(\s*(\d{1,2})\s*\)?", norm)
+            if not match:
+                match = re.search(r"(?:st|s1|sf|ot|lpg)\s*\(?\s*(\d{1,2})", norm)
+            suffix = f" ST ({match.group(1)})" if match else ""
+            return f"LPG{suffix}".strip()
+
+        return clean_desc(value)
+
+    def is_vat_or_financial_line(norm_line, values):
+        # Typické DPH riadky začínajú sadzbou 23/19/5 %.
+        if re.match(r"^\s*(23|20|19|10|5|0|13|2s)\s*[%.,]", norm_line):
+            return True
+
+        # Riadok s troma alebo viacerými sumami bez jednotky/tovarového hintu je skoro vždy DPH/reKAPitulácia.
+        if len(values) >= 3 and not re.search(unit_tokens_re, norm_line) and not has_item_hint(norm_line):
+            return True
+
+        return False
+
+    def semantic_letters(norm_line):
+        # Odstráň čísla, meny a bežné OCR fragmenty, aby riadok typu "102 1.61 8,ats EUR" nevyzeral ako položka.
+        stripped = re.sub(r"[-+]?\d+\s*[,.]\s*\d{1,3}|\d+", " ", norm_line)
+        stripped = re.sub(currency_noise_re, " ", stripped)
+        stripped = re.sub(r"[^a-z]+", "", stripped)
+        return stripped
+
+    candidates = []
+    product_names_seen = []
+    last_description = ""
+    context_ttl = 0
+
+    for raw_line in lines:
+        if _is_debug_line(raw_line):
+            last_description = ""
+            context_ttl = 0
+            continue
+
+        # Ak OCR spojí riadok cez zvislú čiaru, posudzujeme segmenty samostatne.
+        segments = [segment.strip() for segment in re.split(r"\s+\|\s+", raw_line) if segment.strip()]
+
+        for line in segments:
+            norm_line = _normalize_text(line)
+            values = parse_money_values(line)
+
+            if has_admin(norm_line):
+                # Platobný/rekapitulačný riadok zároveň ukončí kontext položky,
+                # aby sa názov položky neprilepil na neskoršiu DPH tabuľku.
+                last_description = ""
+                context_ttl = 0
+                continue
+
+            letters = semantic_letters(norm_line)
+
+            if not values:
+                if len(letters) >= 3 and (has_item_hint(norm_line) or len(norm_line) <= 70):
+                    desc = clean_desc(line)
+                    last_description = desc
+                    context_ttl = 2
+                    if has_item_hint(norm_line):
+                        product_names_seen.append(desc)
+                continue
+
+            has_unit = bool(re.search(unit_tokens_re, norm_line))
+            product_context = bool(
+                last_description
+                and context_ttl > 0
+                and (has_item_hint(_normalize_text(last_description)) or has_unit)
+            )
+            item_hint = has_item_hint(norm_line) or product_context
+
+            if is_vat_or_financial_line(norm_line, values) and not item_hint:
+                continue
+
+            # Bez názvu položky nechceme brať riadky, ktoré obsahujú iba čísla a menu.
+            if len(letters) < 3 and not item_hint:
+                continue
+
+            price = round(values[-1], 2)
+            if price < 0.05:
+                continue
+            if total and price > float(total) + 0.20:
+                continue
+
+            product_name = ""
+            current_has_product_name = any(token in norm_line for token in [
+                "lpg", "natural", "nafta", "diesel", "benzin", "benz",
+                "tmel", "plech", "lak", "pies", "krmivo", "aqua", "profil",
+                "sada", "sala", "kliest", "kliesti", "klesti", "klies", "konc",
+            ])
+
+            # Ak aktuálny riadok obsahuje skutočný názov položky, preferujeme ho pred predchádzajúcim
+            # kontextom. Samotné "ks/kus/kg" nestačí, lebo to býva len cenový riadok k predošlému názvu.
+            if current_has_product_name:
+                product_name = normalize_product_name(line)
+            elif product_context:
+                product_name = normalize_product_name(last_description)
+
+            if product_context and not current_has_product_name:
+                description = clean_desc(f"{product_name or last_description} | {line}")
+            elif product_name:
+                description = product_name
+            else:
+                description = clean_desc(line)
+
+            # Pri známych kusových položkách nechceme do popisu prilepiť jednotkovú cenu, celkovú cenu ani menu.
+            # Typický prípad: "Sada klieští vr,konc 1 Kus" + ďalší riadok s cenami.
+            if product_name and _normalize_text(product_name).startswith("sada kliest"):
+                description = product_name
+
+            # Palivové položky vraciame kompaktne, ak je riadková cena spoľahlivo čitateľná.
+            elif product_name and re.search(r"\b(eur|fur|eir|cur)\b", norm_line):
+                description = f"{product_name} | {price:.2f} EUR".replace(".", ",")
+
+            score = price
+            if item_hint:
+                score += 100
+            if has_unit:
+                score += 25
+            if re.search(r"\b(eur|fur|eir|cur)\b", norm_line):
+                score += 10
+            if product_name:
+                score += 15
+            if total:
+                score += min(price, float(total)) / max(float(total), 1.0) * 10
+
+            candidates.append((score, price, description, product_name))
+
+            # Cenový riadok, ktorý obsahuje názov položky, môže byť kontext pre ďalší riadok.
+            if has_item_hint(norm_line):
+                last_description = clean_desc(line)
+                context_ttl = 2
+            elif context_ttl > 0:
+                context_ttl -= 1
+
+    distinct_product_names = []
+    for raw_name in product_names_seen:
+        name = normalize_product_name(raw_name)
+        key = _normalize_text(name)
+        if key and key not in [_normalize_text(existing) for existing in distinct_product_names]:
+            distinct_product_names.append(name)
+
+    if not candidates:
+        return distinct_product_names[-1] if distinct_product_names else ""
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    best_score, best_price, best_description, best_product_name = candidates[0]
+
+    # Ak je iba jeden rozpoznaný produkt a cenový riadok je zjavne poškodený OCR,
+    # radšej vrátime čistý názov položky bez nesprávnej ceny.
+    if len(distinct_product_names) == 1 and total and best_price < max(float(total) * 0.70, float(total) - 1.00):
+        return distinct_product_names[0]
+
+    return best_description
+
+
+def parse_receipt_text(text, receipt_id, file_name):
+    payment_total, payment_source = find_payment_total(text)
+    vat = find_vat_table(text, total=payment_total)
+    return {
+        "Názov súboru": file_name,
+        "Doklad": receipt_id,
+        "Stav": "OK",
+        "Dátum vystavenia": find_date(text),
+        "Sadzba DPH": vat["sadzba_dph"],
+        "Základ DPH": format_eur(vat["zaklad_dph"]),
+        "DPH": format_eur(vat["dph"]),
+        "Obrat DPH": format_eur(vat.get("obrat_dph")),
+        "Zaokrúhlenie": format_eur(vat.get("zaokruhlenie", 0.0)),
+        "Spolu s DPH": format_eur(vat["spolu_s_dph"]),
+        "Suma na úhradu": format_eur(vat.get("payment_total", payment_total)),
+        "Popis najväčšej položky": find_largest_item(text, total=vat["spolu_s_dph"]),
+        "Zdroj sumy na úhradu": vat.get("payment_source", payment_source),
+        "Zdroj zaokrúhlenia": vat.get("rounding_source", ""),
+        "Zdroj DPH": vat.get("vat_source", ""),
+        "OCR text": text.strip(),
+    }
+
+def is_valid_receipt_row(row):
+    """
+    Rozhodne, či OCR výrez vyzerá ako reálny pokladničný blok.
+    Cieľ: keď PDF neobsahuje žiadny blok, nezapísať falošný doklad z prázdnej strany.
+    """
+    has_date = bool(row.get("Dátum vystavenia"))
+    has_total = row.get("Suma na úhradu") not in ("", None) or row.get("Spolu s DPH") not in ("", None)
+    has_vat = row.get("DPH") not in ("", None)
+    has_item = bool(row.get("Popis najväčšej položky"))
+    ocr_text = row.get("OCR text", "") or ""
+    norm_text = _normalize_text(ocr_text)
+    receipt_keywords = [
+        "dph", "sadzba", "zaklad", "na uhradu", "uhradu eur", "karta",
+        "hotovost", "pokladnica", "pokladna", "ekasa", "doklad", "uctenka",
+        "ciastka eur", "medzisucet"
+    ]
+    has_keyword = any(keyword in norm_text for keyword in receipt_keywords)
+    validation_mode = str(CONFIG.get("validation_mode", "normal")).strip().lower()
+
+    if validation_mode == "strict":
+        return bool((has_total and has_vat and (has_keyword or has_date)) or (has_date and has_total and has_keyword))
+
+    if validation_mode == "loose":
+        if has_total or has_vat:
+            return True
+        if (has_date or has_item) and has_keyword:
+            return True
+        return False
+
+    # Normal: silné prípady. Máme total alebo DPH + aspoň nejaký kontext.
+    if (has_total or has_vat) and (has_keyword or has_date or has_item):
+        return True
+
+    # Slabší prípad: OCR prečítalo dátum a text vyzerá ako účtenka.
+    if has_date and has_keyword:
+        return True
+
+    return False
+
+
+
+def make_not_found_row(file_name):
+    return {
+        "Názov súboru": file_name,
+        "Doklad": "",
+        "Stav": "blok nenajdeny",
+        "Dátum vystavenia": "",
+        "Sadzba DPH": "",
+        "Základ DPH": "",
+        "DPH": "",
+        "Obrat DPH": "",
+        "Zaokrúhlenie": "",
+        "Spolu s DPH": "",
+        "Suma na úhradu": "",
+        "Popis najväčšej položky": "",
+        "Zdroj sumy na úhradu": "",
+        "Zdroj zaokrúhlenia": "",
+        "Zdroj DPH": "",
+        "OCR text": "",
+    }
+
+
+def save_excel(rows, output_path: Path):
+    df = pd.DataFrame(rows)
+
+    visible_cols = [
+        "Názov súboru",
+        "Doklad",
+        "Stav",
+        "Dátum vystavenia",
+        "Sadzba DPH",
+        "Základ DPH",
+        "DPH",
+        "Suma na úhradu",
+        "Spolu s DPH",
+        "Obrat DPH",
+        "Zaokrúhlenie",
+        "Popis najväčšej položky",
+    ]
+
+    debug_cols = [
+        "Názov súboru",
+        "Doklad",
+        "Stav",
+        "Zdroj sumy na úhradu",
+        "Zdroj zaokrúhlenia",
+        "Zdroj DPH",
+        "OCR text",
+    ]
+
+    for col in visible_cols + debug_cols:
+        if col not in df.columns:
+            df[col] = ""
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        df[visible_cols].to_excel(writer, sheet_name="Doklady", index=False)
+        if CONFIG.get("write_ocr_text_sheet", True):
+            df[debug_cols].to_excel(writer, sheet_name="OCR text", index=False)
+
+        ws = writer.book["Doklady"]
+
+        # Kontrolné stĺpce.
+        # E = Sadzba DPH, F = Základ, G = DPH, H = Suma na úhradu,
+        # I = Spolu s DPH, J = Obrat DPH, K = Zaokrúhlenie.
+        ws["M1"] = "Check sadzba"
+        ws["N1"] = "Kontrola sadzby"
+        ws["O1"] = "Check súčet DPH"
+        ws["P1"] = "Kontrola súčtu DPH"
+        ws["Q1"] = "Check úhrada"
+        ws["R1"] = "Kontrola úhrady"
+        ws["S1"] = "Check spolu/úhrada"
+        ws["T1"] = "Kontrola spolu/úhrada"
+
+        tolerance = float(CONFIG.get("check_tolerance", 0.002))
+        rate_tolerance = float(CONFIG.get("rate_check_tolerance", 0.02))
+
+        for row_idx in range(2, ws.max_row + 1):
+            ws[f"M{row_idx}"] = (
+                f'=IFERROR(F{row_idx}*(1+'
+                f'VALUE(TRIM(SUBSTITUTE(SUBSTITUTE(E{row_idx},"odhad",""),"%","")))/100)'
+                f'-J{row_idx},"")'
+            )
+            ws[f"N{row_idx}"] = (
+                f'=IF(M{row_idx}="","",'
+                f'IF(ABS(M{row_idx})>{rate_tolerance},"Chyba - sadzba nesedí na Obrat DPH","OK"))'
+            )
+            ws[f"O{row_idx}"] = f'=IFERROR(F{row_idx}+G{row_idx}-J{row_idx},"")'
+            ws[f"P{row_idx}"] = (
+                f'=IF(O{row_idx}="","",'
+                f'IF(ABS(O{row_idx})>{tolerance},"Chyba - Základ + DPH nesedí na Obrat DPH","OK"))'
+            )
+            ws[f"Q{row_idx}"] = f'=IFERROR(J{row_idx}+K{row_idx}-H{row_idx},"")'
+            ws[f"R{row_idx}"] = (
+                f'=IF(Q{row_idx}="","",'
+                f'IF(ABS(Q{row_idx})>{tolerance},"Chyba - Obrat + zaokrúhlenie nesedí na úhradu","OK"))'
+            )
+            ws[f"S{row_idx}"] = f'=IFERROR(I{row_idx}-H{row_idx},"")'
+            ws[f"T{row_idx}"] = (
+                f'=IF(S{row_idx}="","",'
+                f'IF(ABS(S{row_idx})>{tolerance},"Chyba - Spolu s DPH nie je suma na úhradu","OK"))'
+            )
+
+        widths = {
+            "A": 34, "B": 10, "C": 18, "D": 18, "E": 16, "F": 14,
+            "G": 12, "H": 14, "I": 14, "J": 14, "K": 16, "L": 60,
+            "M": 16, "N": 34, "O": 18, "P": 38, "Q": 18, "R": 44,
+            "S": 18, "T": 38,
+        }
+        for col, width in widths.items():
+            ws.column_dimensions[col].width = width
+
+        # F až K sú peňažné stĺpce.
+        for row in ws.iter_rows(min_row=2, min_col=6, max_col=11):
+            for cell in row:
+                cell.number_format = '#,##0.00 €'
+
+        for col_idx in [13, 15, 17, 19]:
+            for row in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
+                for cell in row:
+                    cell.number_format = '#,##0.000000 €'
+
+def process_file(file_path: Path):
+    """Spracuje jeden vstupný súbor a vráti riadky do spoločného Excelu."""
+    file_t0 = time.perf_counter()
+    load_t0 = time.perf_counter()
+    pages = load_input_file(file_path)
+    log_time("Načítanie súboru / PDF prevod", time.perf_counter() - load_t0, indent=2)
+
+    rows = []
+    receipt_counter = 1
+    debug_enabled = bool(CONFIG.get("debug_enabled", True))
+    file_debug_dir = DEBUG_DIR / file_path.stem
+    if debug_enabled:
+        file_debug_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nSpracúvam: {file_path.name}")
+
+    for page_number, page_img in pages:
+        detect_t0 = time.perf_counter()
+        boxes = detect_receipts(page_img)
+        log_time(f"Strana {page_number} - detekcia bločkov", time.perf_counter() - detect_t0, indent=4)
+
+        debug_page = page_img.copy()
+        print(f"  Strana {page_number}: kandidáti na bločky = {len(boxes)}")
+
+        for box_index, (x1, y1, x2, y2) in enumerate(boxes, start=1):
+            receipt_t0 = time.perf_counter()
+            crop = page_img[y1:y2, x1:x2]
+            if debug_enabled:
+                debug_t0 = time.perf_counter()
+                crop_path = file_debug_dir / f"page_{page_number}_receipt_{box_index}.png"
+                cv2.imwrite(str(crop_path), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+                log_time(f"Doklad {box_index} - uloženie debug obrázka", time.perf_counter() - debug_t0, indent=8)
+
+            text = run_ocr(crop)
+            if debug_enabled:
+                debug_t0 = time.perf_counter()
+                txt_path = file_debug_dir / f"page_{page_number}_receipt_{box_index}.txt"
+                txt_path.write_text(text, encoding="utf-8")
+                log_time(f"Doklad {box_index} - uloženie OCR txt", time.perf_counter() - debug_t0, indent=8)
+
+            parse_t0 = time.perf_counter()
+            row = parse_receipt_text(text, receipt_counter, file_path.name)
+            log_time(f"Doklad {box_index} - parser", time.perf_counter() - parse_t0, indent=8)
+
+            if is_valid_receipt_row(row):
+                rows.append(row)
+                receipt_counter += 1
+                cv2.rectangle(debug_page, (x1, y1), (x2, y2), (255, 0, 0), 6)
+            else:
+                # Neplatný kandidát nechávame iba v debug TXT/PNG, do Excelu nejde.
+                cv2.rectangle(debug_page, (x1, y1), (x2, y2), (255, 165, 0), 4)
+            log_time(f"Doklad {box_index} - spolu", time.perf_counter() - receipt_t0, indent=6)
+
+        if debug_enabled:
+            debug_t0 = time.perf_counter()
+            debug_detect_path = file_debug_dir / f"page_{page_number}_detected.png"
+            cv2.imwrite(str(debug_detect_path), cv2.cvtColor(debug_page, cv2.COLOR_RGB2BGR))
+            log_time(f"Strana {page_number} - uloženie detected debug", time.perf_counter() - debug_t0, indent=4)
+
+    if not rows:
+        print("  Výsledok: blok nenajdeny")
+        rows.append(make_not_found_row(file_path.name))
+    else:
+        print(f"  Výsledok: nájdené doklady = {len(rows)}")
+
+    log_time(f"Súbor {file_path.name} - spolu", time.perf_counter() - file_t0, indent=2)
+    return rows
+
+def process_all_pdfs(input_dir: Path = INPUT_DIR):
+    """Načíta všetky podporované súbory z adresára Input/input a uloží jeden spoločný Excel."""
+    if not input_dir.exists():
+        input_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Vytvorený vstupný priečinok: {input_dir}")
+
+    input_files = _list_input_files(input_dir)
+
+    total_t0 = time.perf_counter()
+    rows = []
+
+    if not input_files:
+        print(f"V priečinku {input_dir} nie sú žiadne podporované súbory: {', '.join(SUPPORTED_EXTENSIONS)}.")
+        rows.append(make_not_found_row(""))
+    else:
+        print(f"Počet vstupných súborov na spracovanie: {len(input_files)}")
+        for pdf_path in input_files:
+            try:
+                rows.extend(process_file(pdf_path))
+            except Exception as exc:
+                print(f"  Chyba pri spracovaní súboru {pdf_path.name}: {exc}")
+                error_row = make_not_found_row(pdf_path.name)
+                error_row["Stav"] = f"chyba spracovania: {exc}"
+                rows.append(error_row)
+
+    output_path = OUTPUT_DIR / str(CONFIG.get("output_filename", "doklady_vystup.xlsx"))
+    excel_t0 = time.perf_counter()
+    save_excel(rows, output_path)
+    log_time("Excel export", time.perf_counter() - excel_t0, indent=0)
+    log_time("Celkový čas spracovania", time.perf_counter() - total_t0, indent=0)
+
+    print("\nHotovo.")
+    print(f"Spracované vstupné súbory: {len(input_files)}")
+    print(f"Riadky v Exceli: {len(rows)}")
+    print(f"Excel: {output_path}")
+    if CONFIG.get("debug_enabled", True):
+        print(f"Debug súbory: {DEBUG_DIR}")
+
+
+def main():
+    # Štandardné použitie: bez parametra spracuje všetky podporované súbory z adresára podľa config.json.
+    # Voliteľne možno zadať iný priečinok: python3 main.py cesta/k/priecinku
+    if len(sys.argv) >= 2:
+        input_dir = Path(sys.argv[1])
+    else:
+        input_dir = select_default_input_dir()
+
+    if input_dir.is_file():
+        # Kompatibilita so starým použitím: ak zadáš jeden podporovaný súbor, spracuje sa len ten.
+        rows = process_file(input_dir)
+        output_path = OUTPUT_DIR / f"{input_dir.stem}_vystup.xlsx"
+        save_excel(rows, output_path)
+        print("\nHotovo.")
+        print(f"Excel: {output_path}")
+        if CONFIG.get("debug_enabled", True):
+            print(f"Debug súbory: {DEBUG_DIR}")
+        return
+
+    process_all_pdfs(input_dir)
+
+
+if __name__ == "__main__":
+    main()
