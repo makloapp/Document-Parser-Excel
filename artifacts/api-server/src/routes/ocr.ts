@@ -55,7 +55,6 @@ const OCR_SCRIPT = path.join(
   "..",
   "..",
   "..",
-  "..",
   "scripts",
   "ocr_process.py",
 );
