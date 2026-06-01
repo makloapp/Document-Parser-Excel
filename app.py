@@ -12,7 +12,10 @@ st.set_page_config(page_title="OCR dokladov", layout="centered")
 
 st.title("OCR spracovanie dokladov")
 
-st.write("Nahraj ZIP súbor s JPG, PNG, TIFF, WEBP alebo PDF dokladmi. Aplikácia vytvorí jeden spoločný Excel.")
+st.write("Nahraj ZIP súbor s JPG, PNG, TIFF, WEBP alebo PDF dokladmi. Aplikácia vytvorí jeden spoločný Excel. ")
+
+st.write(" Načítanie môže trvať niekoľko minút. ")
+st.write(" Výsledok závisí od kvality obrázkov. ")
 
 uploaded_zip = st.file_uploader(
     "Vyber ZIP súbor s dokladmi",
