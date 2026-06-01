@@ -28,6 +28,7 @@ export const ProcessReceiptBody = zod.object({
 export const ProcessReceiptResponse = zod.object({
   "jobId": zod.string(),
   "fileName": zod.string(),
+  "fileCount": zod.number(),
   "rows": zod.array(zod.object({
   "nazovSuboru": zod.string(),
   "doklad": zod.number().nullish(),
@@ -64,6 +65,7 @@ export const DownloadExcelParams = zod.object({
 export const ListJobsResponseItem = zod.object({
   "jobId": zod.string(),
   "fileName": zod.string(),
+  "fileCount": zod.number(),
   "totalReceipts": zod.number(),
   "validReceipts": zod.number(),
   "processedAt": zod.string()

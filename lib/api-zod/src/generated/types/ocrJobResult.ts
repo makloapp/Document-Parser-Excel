@@ -10,6 +10,7 @@ import type { ReceiptRow } from './receiptRow';
 export interface OcrJobResult {
   jobId: string;
   fileName: string;
+  fileCount: number;
   rows: ReceiptRow[];
   totalReceipts: number;
   validReceipts: number;

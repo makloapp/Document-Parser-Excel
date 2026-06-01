@@ -9,6 +9,7 @@
 export interface OcrJobSummary {
   jobId: string;
   fileName: string;
+  fileCount: number;
   totalReceipts: number;
   validReceipts: number;
   processedAt: string;

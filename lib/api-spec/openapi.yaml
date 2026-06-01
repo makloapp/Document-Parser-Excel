@@ -162,6 +162,8 @@ components:
           type: string
         fileName:
           type: string
+        fileCount:
+          type: integer
         rows:
           type: array
           items:
@@ -175,6 +177,7 @@ components:
       required:
         - jobId
         - fileName
+        - fileCount
         - rows
         - totalReceipts
         - validReceipts
@@ -187,6 +190,8 @@ components:
           type: string
         fileName:
           type: string
+        fileCount:
+          type: integer
         totalReceipts:
           type: integer
         validReceipts:
@@ -196,6 +201,7 @@ components:
       required:
         - jobId
         - fileName
+        - fileCount
         - totalReceipts
         - validReceipts
         - processedAt

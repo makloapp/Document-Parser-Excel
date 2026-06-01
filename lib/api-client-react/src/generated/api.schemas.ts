@@ -39,6 +39,7 @@ export interface ReceiptRow {
 export interface OcrJobResult {
   jobId: string;
   fileName: string;
+  fileCount: number;
   rows: ReceiptRow[];
   totalReceipts: number;
   validReceipts: number;
@@ -48,6 +49,7 @@ export interface OcrJobResult {
 export interface OcrJobSummary {
   jobId: string;
   fileName: string;
+  fileCount: number;
   totalReceipts: number;
   validReceipts: number;
   processedAt: string;
