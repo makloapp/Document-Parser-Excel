@@ -1,5 +1,6 @@
 import { useState, useCallback } from "react";
-import { useProcessReceipt, useListJobs, getListJobsQueryKey } from "@workspace/api-client-react";
+import { useMutation } from "@tanstack/react-query";
+import { getListJobsQueryKey } from "@workspace/api-client-react";
 import type { OcrJobResult } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useToast } from "@/hooks/use-toast";
@@ -7,41 +8,41 @@ import { UploadZone } from "@/components/upload-zone";
 import { ResultsTable } from "@/components/results-table";
 import { JobHistory } from "@/components/job-history";
 
+async function uploadReceipts(form: FormData): Promise<OcrJobResult> {
+  const res = await fetch("/api/ocr/process", { method: "POST", body: form });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json?.error ?? `HTTP ${res.status}`);
+  return json as OcrJobResult;
+}
+
 export default function Home() {
   const [currentJob, setCurrentJob] = useState<OcrJobResult | null>(null);
   const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number } | null>(null);
   const { toast } = useToast();
   const queryClient = useQueryClient();
 
-  const processMutation = useProcessReceipt({
-    mutation: {
-      onSuccess: (data) => {
-        setCurrentJob(data);
-        setUploadProgress(null);
-        queryClient.invalidateQueries({ queryKey: getListJobsQueryKey() });
-        const count = data.fileCount ?? 1;
-        toast({
-          title: "Spracovanie úspešné",
-          description:
-            count > 1
-              ? `Spracovaných ${count} súborov — nájdených ${data.validReceipts} dokladov.`
-              : `Extrahované dáta z dokladu ${data.fileName}.`,
-        });
-      },
-      onError: (err) => {
-        setUploadProgress(null);
-        const msg =
-          (err.data && typeof err.data === "object" && "error" in err.data
-            ? (err.data as { error?: string }).error
-            : undefined) ??
-          err.message ??
-          "Nepodarilo sa spracovať doklad.";
-        toast({
-          title: "Chyba pri spracovaní",
-          description: msg,
-          variant: "destructive",
-        });
-      },
+  const processMutation = useMutation({
+    mutationFn: uploadReceipts,
+    onSuccess: (data) => {
+      setCurrentJob(data);
+      setUploadProgress(null);
+      queryClient.invalidateQueries({ queryKey: getListJobsQueryKey() });
+      const count = data.fileCount ?? 1;
+      toast({
+        title: "Spracovanie úspešné",
+        description:
+          count > 1
+            ? `Spracovaných ${count} súborov — nájdených ${data.validReceipts} dokladov.`
+            : `Extrahované dáta z dokladu ${data.fileName}.`,
+      });
+    },
+    onError: (err: Error) => {
+      setUploadProgress(null);
+      toast({
+        title: "Chyba pri spracovaní",
+        description: err.message ?? "Nepodarilo sa spracovať doklad.",
+        variant: "destructive",
+      });
     },
   });
 
@@ -54,8 +55,7 @@ export default function Home() {
       } else {
         files.forEach((f) => form.append("files", f));
       }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      processMutation.mutate({ data: form as any });
+      processMutation.mutate(form);
     },
     [processMutation]
   );
