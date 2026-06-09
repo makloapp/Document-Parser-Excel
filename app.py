@@ -12,7 +12,7 @@ APP_VERSION = "v_09.06.2026_12:56"
 
 st.set_page_config(page_title="OCR dokladov", layout="centered")
 
-st.title("OCR spracovanie dokladov")
+st.title("Spracovanie skenov dokladov")
 st.caption(APP_VERSION)
 
 st.write("Nahraj ZIP súbor s JPG, PNG, TIFF, WEBP alebo PDF dokladmi. Aplikácia vytvorí jeden spoločný Excel. ")
