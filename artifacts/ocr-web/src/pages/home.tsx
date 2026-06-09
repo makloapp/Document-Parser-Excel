@@ -127,6 +127,11 @@ export default function Home() {
             </div>
             <h1 className="font-semibold text-lg">Doklady.app</h1>
           </div>
+          <span className="text-xs text-muted-foreground tabular-nums">
+            v{new Date(__BUILD_TIME__).toLocaleDateString("sk-SK", { day: "2-digit", month: "2-digit", year: "numeric" })}
+            {" "}
+            {new Date(__BUILD_TIME__).toLocaleTimeString("sk-SK", { hour: "2-digit", minute: "2-digit" })}
+          </span>
         </div>
       </header>
 
