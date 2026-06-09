@@ -871,84 +871,75 @@ def find_vat_table(text, total=None):
     return best
 
 
-def find_largest_item(text, total=None):
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    admin_tokens = ["dph", "zaklad", "sadzba", "dan", "obrat", "rekapitulacia", "zaokruh", "spolu", "celkom", "uhrad", "hotovost", "hotovosf", "vratene", "vraten", "vydavok", "vydane", "karta", "kartou", "platba", "ciastka", "clastka", "medzisucet", "pokladnica", "pokladna", "doklad", "datum", "datun", "duzp", "cas:", "ico", "ic dph", "dic", "kp:", "cislo", "registracie", "drzitel", "drzitela", "meno", "okp", "uid", "overte", "qr", "ekasa", "terminal", "clerk", "contactless", "mastercard", "autoriz", "potvrdenka", "zakaznika", "uschovajte", "dakujeme", "dakujem", "mohli", "bodov", "body", "prevadzka", "hlavna", "pezinok", "vinicne", "hornbach", "galvaniho", "raca", "rozpis plat", "rozpis", "fakturu", "uctenky", "nepouzit", "podmienok"]
-    item_hint_tokens = ["lpg", "natural", "nafta", "diesel", "benzin", "benz", "tmel", "plech", "lak", "pies", "krmivo", "aqua", "profil", "sada", "kliest", "kliesti", "klesti", "kliešt", "konc", "st(", "st (", "ks", "kus", "kg"]
-    unit_tokens_re = r"\b(l|ks|kus|kg|g|bal|balenie|m|m2|m3|ml|l\.)\b|\bx\b"
-    currency_noise_re = r"\b(eur|fur|eir|cur|cui|fike|fik|ats|bur)\b"
+def find_company_name(text):
+    """Extrahuje názov firmy/spoločnosti z prvých riadkov bločku.
+    Hľadá riadky obsahujúce 's.r.o', 'a.s.', 'k.s.', 'spol.' atď.
+    Ak nenájde, vráti prvé zmysluplné riadky hlavičky.
+    """
+    # Vzory pre právne formy
+    legal_re = re.compile(
+        r"\b(s\.?\s*r\.?\s*o\.?|a\.?\s*s\.?|k\.?\s*s\.?|v\.?\s*o\.?\s*s\.?|"
+        r"spol\.|s\.?\s*p\.?|z\.?\s*o\.?\s*o\.?|ltd\.?|gmbh|inc\.?|"
+        r"o\.?\s*z\.?|n\.?\s*o\.?|s\.?\s*r\.?\s*o|a\.?\s*s)\b",
+        re.IGNORECASE,
+    )
+    # Tokeny ktoré naznačujú, že ide o administrative riadok (nie hlavičku firmy)
+    skip_tokens = [
+        "dph", "zaklad", "dan", "obrat", "spolu", "celkom", "uhrad",
+        "hotovost", "karta", "platba", "medzisucet", "pokladnica", "datum",
+        "datun", "ico", "dic", "cislo", "registr", "uid", "qr", "ekasa",
+        "autoriz", "potvrdenka", "dakujem", "uschovajte", "bodov",
+        "overenie", "terminal", "mastercard", "visa", "contactless",
+        "zaokruh", "sadzba",
+    ]
 
-    def has_admin(norm_line):
-        return any(token in norm_line for token in admin_tokens)
+    def is_skip(norm):
+        return any(t in norm for t in skip_tokens)
 
-    def has_item_hint(norm_line):
-        return any(token in norm_line for token in item_hint_tokens)
+    def clean(line):
+        line = re.sub(r"\s+", " ", line).strip(" |;:-.,")
+        return line
 
-    def clean_desc(value):
-        value = re.sub(r"\s+", " ", value).strip(" |;:-")
-        for src, dst in {"FUR": "EUR", "EIR": "EUR", "CUR": "EUR", "CUI": "EUR", "Fike": "EUR", "BUR": "EUR"}.items():
-            value = value.replace(src, dst)
-        return value
-
-    candidates = []
-    last_description = ""
-    context_ttl = 0
-
-    for raw_line in lines:
-        if _is_debug_line(raw_line):
-            last_description = ""
-            context_ttl = 0
+    raw_lines = [l.strip() for l in text.splitlines()]
+    # Berieme len prvých 20 riadkov (hlavička dokladu)
+    top_lines = []
+    for l in raw_lines[:40]:
+        if _is_debug_line(l):
             continue
-        segments = [segment.strip() for segment in re.split(r"\s+\|\s+", raw_line) if segment.strip()]
-        for line in segments:
-            norm_line = _normalize_text(line)
-            values = parse_money_values(line)
-            if has_admin(norm_line):
-                last_description = ""
-                context_ttl = 0
-                continue
-            stripped = re.sub(r"[-+]?\d+\s*[,.]\s*\d{1,3}|\d+", " ", norm_line)
-            stripped = re.sub(currency_noise_re, " ", stripped)
-            letters = re.sub(r"[^a-z]+", "", stripped)
-            if not values:
-                if len(letters) >= 3 and (has_item_hint(norm_line) or len(norm_line) <= 70):
-                    last_description = clean_desc(line)
-                    context_ttl = 2
-                continue
-            has_unit = bool(re.search(unit_tokens_re, norm_line))
-            product_context = bool(last_description and context_ttl > 0 and (has_item_hint(_normalize_text(last_description)) or has_unit))
-            item_hint = has_item_hint(norm_line) or product_context
-            is_vat = re.match(r"^\s*(23|20|19|10|5|0|13|2s)\s*[%.,]", norm_line) or (len(values) >= 3 and not re.search(unit_tokens_re, norm_line) and not has_item_hint(norm_line))
-            if is_vat and not item_hint:
-                continue
-            if len(letters) < 3 and not item_hint:
-                continue
-            price = round(values[-1], 2)
-            if price < 0.05:
-                continue
-            if total and price > float(total) + 0.20:
-                continue
-            description = clean_desc(f"{last_description} | {line}") if product_context else clean_desc(line)
-            score = price
-            if item_hint:
-                score += 100
-            if has_unit:
-                score += 25
-            if re.search(r"\b(eur|fur|eir|cur)\b", norm_line):
-                score += 10
-            if total:
-                score += min(price, float(total)) / max(float(total), 1.0) * 10
-            candidates.append((score, price, description))
-            if has_item_hint(norm_line):
-                last_description = clean_desc(line)
-                context_ttl = 2
-            elif context_ttl > 0:
-                context_ttl -= 1
+        if not l:
+            continue
+        top_lines.append(l)
+        if len(top_lines) >= 20:
+            break
 
-    if not candidates:
-        return ""
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return candidates[0][2]
+    # Priorita 1: riadok s právnou formou
+    for line in top_lines:
+        norm = _normalize_text(line)
+        if is_skip(norm):
+            continue
+        if legal_re.search(line):
+            letters = re.sub(r"[^a-zA-ZÀ-žÀ-ž]", "", line)
+            if len(letters) >= 3:
+                return clean(line)
+
+    # Priorita 2: prvé 2 zmysluplné riadky bez čísel, bez skip tokenov
+    header_parts = []
+    for line in top_lines:
+        norm = _normalize_text(line)
+        if is_skip(norm):
+            continue
+        # Preskočiť riadky kde väčšina znakov sú číslice alebo špeciálne znaky
+        letters = re.sub(r"[^a-zA-ZÀ-žÀ-ž\s]", "", line).strip()
+        if len(letters) < 3:
+            continue
+        # Preskočiť príliš krátke riadky (napr. "OK", "1")
+        if len(line.strip()) < 3:
+            continue
+        header_parts.append(clean(line))
+        if len(header_parts) >= 2:
+            break
+
+    return " | ".join(header_parts)
 
 
 def parse_receipt_text(text, receipt_id, file_name):
@@ -966,7 +957,7 @@ def parse_receipt_text(text, receipt_id, file_name):
         "zaokruhlenie": format_eur(vat.get("zaokruhlenie", 0.0)),
         "spoluSDph": format_eur(vat["spolu_s_dph"]),
         "sumaNaUhradu": format_eur(vat.get("payment_total", payment_total)),
-        "popisNajvacsejPolozky": find_largest_item(text, total=vat["spolu_s_dph"]),
+        "popisNajvacsejPolozky": find_company_name(text),
     }
 
 
@@ -1137,10 +1128,10 @@ def save_excel(rows, output_path: Path):
             "Spolu s DPH": row.get("spoluSDph"),
             "Obrat DPH": row.get("obratDph"),
             "Zaokrúhlenie": row.get("zaokruhlenie"),
-            "Popis najväčšej položky": row.get("popisNajvacsejPolozky", ""),
+            "Text": row.get("popisNajvacsejPolozky", ""),
         })
     df = pd.DataFrame(excel_rows)
-    visible_cols = ["Názov súboru", "Doklad", "Stav", "Dátum vystavenia", "Sadzba DPH", "Základ DPH", "DPH", "Suma na úhradu", "Spolu s DPH", "Obrat DPH", "Zaokrúhlenie", "Popis najväčšej položky"]
+    visible_cols = ["Názov súboru", "Doklad", "Stav", "Dátum vystavenia", "Sadzba DPH", "Základ DPH", "DPH", "Suma na úhradu", "Spolu s DPH", "Obrat DPH", "Zaokrúhlenie", "Text"]
     for col in visible_cols:
         if col not in df.columns:
             df[col] = ""

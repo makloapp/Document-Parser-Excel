@@ -72,7 +72,7 @@ export function ResultsTable({ job }: ResultsTableProps) {
                 <TableHead className="text-right">Zaokrúhlenie</TableHead>
                 <TableHead className="text-right">Spolu s DPH</TableHead>
                 <TableHead className="text-right">Suma na úhradu</TableHead>
-                <TableHead>Popis položky</TableHead>
+                <TableHead>Text</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>

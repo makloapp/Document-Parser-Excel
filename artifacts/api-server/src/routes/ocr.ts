@@ -301,11 +301,11 @@ for row in rows:
         "Spolu s DPH": row.get("spoluSDph"),
         "Obrat DPH": row.get("obratDph"),
         "Zaokrúhlenie": row.get("zaokruhlenie"),
-        "Popis najväčšej položky": row.get("popisNajvacsejPolozky", ""),
+        "Text": row.get("popisNajvacsejPolozky", ""),
     })
 
 df = pd.DataFrame(excel_rows)
-cols = ["Názov súboru","Doklad","Stav","Dátum vystavenia","Sadzba DPH","Základ DPH","DPH","Suma na úhradu","Spolu s DPH","Obrat DPH","Zaokrúhlenie","Popis najväčšej položky"]
+cols = ["Názov súboru","Doklad","Stav","Dátum vystavenia","Sadzba DPH","Základ DPH","DPH","Suma na úhradu","Spolu s DPH","Obrat DPH","Zaokrúhlenie","Text"]
 for c in cols:
     if c not in df.columns:
         df[c] = ""
