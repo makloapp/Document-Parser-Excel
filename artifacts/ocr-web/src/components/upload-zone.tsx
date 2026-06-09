@@ -1,11 +1,12 @@
 import { useState, useCallback, useRef } from "react";
-import { UploadCloud, Loader2, Archive, X } from "lucide-react";
+import { Archive, X, Loader2 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
+import type { UploadProgress } from "@/pages/home";
 
 interface UploadZoneProps {
   onUpload: (file: File) => void;
   isUploading: boolean;
-  uploadProgress?: { current: number; total: number } | null;
+  uploadProgress: UploadProgress | null;
 }
 
 export function UploadZone({ onUpload, isUploading, uploadProgress }: UploadZoneProps) {
@@ -33,14 +34,12 @@ export function UploadZone({ onUpload, isUploading, uploadProgress }: UploadZone
         setPendingFile(file);
       }
     },
-    [isUploading]
+    [isUploading],
   );
 
   const handleChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      setPendingFile(file);
-    }
+    if (file) setPendingFile(file);
     e.target.value = "";
   }, []);
 
@@ -50,9 +49,10 @@ export function UploadZone({ onUpload, isUploading, uploadProgress }: UploadZone
     setPendingFile(null);
   }, [pendingFile, isUploading, onUpload]);
 
-  const progressLabel = uploadProgress
-    ? `Spracovávam ${uploadProgress.current} / ${uploadProgress.total} dokladov…`
-    : "Rozbaľujem ZIP a spracovávam doklady…";
+  const pct =
+    uploadProgress && uploadProgress.total > 0
+      ? Math.round((uploadProgress.current / uploadProgress.total) * 100)
+      : null;
 
   return (
     <div className="space-y-3">
@@ -62,31 +62,51 @@ export function UploadZone({ onUpload, isUploading, uploadProgress }: UploadZone
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
-            className={`
-              relative flex flex-col items-center justify-center w-full h-44
-              border-2 border-dashed rounded-lg cursor-pointer transition-colors
-              ${isDragging ? "border-primary bg-primary/5" : "border-muted-foreground/20 hover:bg-muted/50"}
-              ${isUploading ? "opacity-50 pointer-events-none" : ""}
-            `}
+            className={[
+              "relative flex flex-col items-center justify-center w-full min-h-44 border-2 border-dashed rounded-lg transition-colors",
+              isUploading ? "opacity-80 cursor-not-allowed" : "cursor-pointer",
+              isDragging ? "border-primary bg-primary/5" : "border-muted-foreground/20 hover:bg-muted/50",
+            ].join(" ")}
           >
-            <div className="flex flex-col items-center justify-center pt-5 pb-6 text-center px-4">
-              {isUploading ? (
-                <>
-                  <Loader2 className="w-10 h-10 text-primary animate-spin mb-3" />
-                  <p className="text-sm font-medium text-foreground">{progressLabel}</p>
-                </>
-              ) : (
-                <>
-                  <Archive className="w-10 h-10 text-muted-foreground mb-3" />
-                  <p className="mb-1 text-sm font-medium text-foreground">
-                    Potiahnite ZIP súbor sem alebo kliknite pre výber
+            {isUploading ? (
+              <div className="w-full px-8 py-8 space-y-4">
+                <div className="flex items-center gap-3">
+                  <Loader2 className="w-5 h-5 text-primary animate-spin shrink-0" />
+                  <p className="text-sm font-medium text-foreground truncate">
+                    {uploadProgress?.statusMessage ?? "Spracovávam…"}
                   </p>
-                  <p className="text-xs text-muted-foreground">
-                    ZIP archív s JPG/PNG dokladmi — spracujeme všetky naraz
-                  </p>
-                </>
-              )}
-            </div>
+                </div>
+
+                {uploadProgress && uploadProgress.total > 0 && (
+                  <>
+                    <div className="w-full bg-muted rounded-full h-2.5 overflow-hidden">
+                      <div
+                        className="bg-primary h-2.5 rounded-full transition-all duration-300"
+                        style={{ width: `${pct ?? 0}%` }}
+                      />
+                    </div>
+                    <div className="flex justify-between text-xs text-muted-foreground">
+                      <span className="truncate max-w-[60%]" title={uploadProgress.fileName}>
+                        {uploadProgress.fileName}
+                      </span>
+                      <span className="shrink-0 tabular-nums">
+                        {uploadProgress.current} / {uploadProgress.total} &nbsp;({pct}%)
+                      </span>
+                    </div>
+                  </>
+                )}
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center py-10 px-4 text-center">
+                <Archive className="w-10 h-10 text-muted-foreground mb-3" />
+                <p className="mb-1 text-sm font-medium text-foreground">
+                  Potiahnite ZIP súbor sem alebo kliknite pre výber
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  ZIP archív s JPG / PNG dokladmi — spracujeme všetky naraz
+                </p>
+              </div>
+            )}
             <input
               ref={inputRef}
               type="file"
@@ -100,7 +120,7 @@ export function UploadZone({ onUpload, isUploading, uploadProgress }: UploadZone
         </CardContent>
       </Card>
 
-      {pendingFile && (
+      {pendingFile && !isUploading && (
         <Card>
           <CardContent className="p-4">
             <div className="flex items-center justify-between gap-3">
@@ -125,8 +145,7 @@ export function UploadZone({ onUpload, isUploading, uploadProgress }: UploadZone
                 </button>
                 <button
                   onClick={handleSubmit}
-                  disabled={isUploading}
-                  className="px-4 py-1.5 text-sm font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+                  className="px-4 py-1.5 text-sm font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
                   data-testid="button-process"
                 >
                   Spracovať

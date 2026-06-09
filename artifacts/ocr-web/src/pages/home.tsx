@@ -8,21 +8,82 @@ import { UploadZone } from "@/components/upload-zone";
 import { ResultsTable } from "@/components/results-table";
 import { JobHistory } from "@/components/job-history";
 
-async function uploadReceipts(form: FormData): Promise<OcrJobResult> {
+export interface UploadProgress {
+  current: number;
+  total: number;
+  fileName: string;
+  statusMessage: string;
+}
+
+async function uploadReceiptsStreaming(
+  form: FormData,
+  onProgress: (p: UploadProgress) => void,
+): Promise<OcrJobResult> {
   const res = await fetch("/api/ocr/process", { method: "POST", body: form });
-  const json = await res.json();
-  if (!res.ok) throw new Error(json?.error ?? `HTTP ${res.status}`);
-  return json as OcrJobResult;
+
+  if (!res.ok || !res.body) {
+    const json = await res.json().catch(() => ({}));
+    throw new Error((json as { error?: string })?.error ?? `HTTP ${res.status}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const raw = line.slice(6).trim();
+      if (!raw) continue;
+
+      let evt: Record<string, unknown>;
+      try {
+        evt = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+
+      if (evt.type === "progress") {
+        onProgress({
+          current: evt.current as number,
+          total: evt.total as number,
+          fileName: evt.fileName as string,
+          statusMessage: `Spracovávam doklad ${evt.current as number} / ${evt.total as number}`,
+        });
+      } else if (evt.type === "status") {
+        onProgress({
+          current: 0,
+          total: 0,
+          fileName: "",
+          statusMessage: evt.message as string,
+        });
+      } else if (evt.type === "complete") {
+        return evt as unknown as OcrJobResult;
+      } else if (evt.type === "error") {
+        throw new Error((evt.message as string) ?? "Neznáma chyba");
+      }
+    }
+  }
+
+  throw new Error("Spojenie sa skončilo bez výsledku.");
 }
 
 export default function Home() {
   const [currentJob, setCurrentJob] = useState<OcrJobResult | null>(null);
-  const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number } | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const { toast } = useToast();
   const queryClient = useQueryClient();
 
   const processMutation = useMutation({
-    mutationFn: uploadReceipts,
+    mutationFn: (form: FormData) =>
+      uploadReceiptsStreaming(form, (p) => setUploadProgress(p)),
     onSuccess: (data) => {
       setCurrentJob(data);
       setUploadProgress(null);
@@ -32,7 +93,7 @@ export default function Home() {
         title: "Spracovanie úspešné",
         description:
           count > 1
-            ? `Spracovaných ${count} súborov — nájdených ${data.validReceipts} dokladov.`
+            ? `Spracovaných ${count} dokladov — nájdených ${data.validReceipts} záznamov.`
             : `Extrahované dáta z dokladu ${data.fileName}.`,
       });
     },
@@ -49,11 +110,11 @@ export default function Home() {
   const handleFileUpload = useCallback(
     (file: File) => {
       const form = new FormData();
-      setUploadProgress({ current: 0, total: 1 });
+      setUploadProgress({ current: 0, total: 0, fileName: "", statusMessage: "Nahrávam súbor…" });
       form.append("file", file);
       processMutation.mutate(form);
     },
-    [processMutation]
+    [processMutation],
   );
 
   return (

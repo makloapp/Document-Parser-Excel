@@ -182,6 +182,10 @@ print('\\n'.join(extracted))
   });
 }
 
+function sseWrite(res: Response, event: Record<string, unknown>) {
+  res.write(`data: ${JSON.stringify(event)}\n\n`);
+}
+
 router.post(
   "/ocr/process",
   upload.single("file"),
@@ -190,6 +194,12 @@ router.post(
       res.status(400).json({ error: "Žiadny súbor nebol nahraný." });
       return;
     }
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
 
     const jobId = uuidv4();
     const excelPath = path.join(EXCEL_DIR, `${jobId}.xlsx`);
@@ -204,14 +214,22 @@ router.post(
     let imageFiles: string[] = [];
 
     try {
+      sseWrite(res, { type: "status", message: "Rozbaľujem ZIP…" });
+
       if (isZip) {
         imageFiles = await extractZipImages(uploadedFile.path, extractDir);
       } else {
         imageFiles = [uploadedFile.path];
       }
 
+      const total = imageFiles.length;
+      sseWrite(res, { type: "total", total });
+
       for (let i = 0; i < imageFiles.length; i++) {
         const imgPath = imageFiles[i];
+        const fileName = path.basename(imgPath);
+        sseWrite(res, { type: "progress", current: i + 1, total, fileName });
+
         const tempExcel = path.join(EXCEL_DIR, `${jobId}_part${i}.xlsx`);
         const result = await runOcrScript(imgPath, tempExcel);
         allRows.push(...result.rows);
@@ -220,6 +238,7 @@ router.post(
         try { fs.unlinkSync(tempExcel); } catch {}
       }
 
+      sseWrite(res, { type: "status", message: "Vytváram Excel…" });
       await buildCombinedExcel(allRows, excelPath);
 
       const record: JobRecord = {
@@ -235,7 +254,8 @@ router.post(
       };
       jobStore.set(jobId, record);
 
-      res.json({
+      sseWrite(res, {
+        type: "complete",
         jobId,
         fileName: record.fileName,
         fileCount: record.fileCount,
@@ -244,11 +264,14 @@ router.post(
         validReceipts: record.validReceipts,
         processingTimeMs: record.processingTimeMs,
       });
+      res.end();
     } catch (err) {
       req.log.error({ err }, "OCR processing failed");
-      res.status(500).json({
-        error: err instanceof Error ? err.message : "Neznáma chyba pri spracovaní.",
+      sseWrite(res, {
+        type: "error",
+        message: err instanceof Error ? err.message : "Neznáma chyba pri spracovaní.",
       });
+      res.end();
     } finally {
       try { fs.unlinkSync(uploadedFile.path); } catch {}
       try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch {}
