@@ -47,14 +47,10 @@ export default function Home() {
   });
 
   const handleFileUpload = useCallback(
-    (files: File[]) => {
+    (file: File) => {
       const form = new FormData();
-      setUploadProgress({ current: 0, total: files.length });
-      if (files.length === 1) {
-        form.append("file", files[0]);
-      } else {
-        files.forEach((f) => form.append("files", f));
-      }
+      setUploadProgress({ current: 0, total: 1 });
+      form.append("file", file);
       processMutation.mutate(form);
     },
     [processMutation]

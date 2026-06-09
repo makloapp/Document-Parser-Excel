@@ -1,23 +1,16 @@
 import { useState, useCallback, useRef } from "react";
-import { UploadCloud, Loader2, X, FileImage } from "lucide-react";
+import { UploadCloud, Loader2, Archive, X } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 
 interface UploadZoneProps {
-  onUpload: (files: File[]) => void;
+  onUpload: (file: File) => void;
   isUploading: boolean;
   uploadProgress?: { current: number; total: number } | null;
 }
 
-const ALLOWED_TYPES = ["image/jpeg", "image/png"];
-
-function filterImageFiles(fileList: FileList | File[]): File[] {
-  return Array.from(fileList).filter((f) => ALLOWED_TYPES.includes(f.type));
-}
-
 export function UploadZone({ onUpload, isUploading, uploadProgress }: UploadZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
-  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -35,45 +28,31 @@ export function UploadZone({ onUpload, isUploading, uploadProgress }: UploadZone
       e.preventDefault();
       setIsDragging(false);
       if (isUploading) return;
-      const files = filterImageFiles(e.dataTransfer.files);
-      if (files.length > 0) {
-        setPendingFiles((prev) => {
-          const names = new Set(prev.map((f) => f.name));
-          return [...prev, ...files.filter((f) => !names.has(f.name))];
-        });
+      const file = e.dataTransfer.files?.[0];
+      if (file && file.name.toLowerCase().endsWith(".zip")) {
+        setPendingFile(file);
       }
     },
     [isUploading]
   );
 
-  const handleChange = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      if (!e.target.files) return;
-      const files = filterImageFiles(e.target.files);
-      if (files.length > 0) {
-        setPendingFiles((prev) => {
-          const names = new Set(prev.map((f) => f.name));
-          return [...prev, ...files.filter((f) => !names.has(f.name))];
-        });
-      }
-      e.target.value = "";
-    },
-    []
-  );
-
-  const removeFile = useCallback((name: string) => {
-    setPendingFiles((prev) => prev.filter((f) => f.name !== name));
+  const handleChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      setPendingFile(file);
+    }
+    e.target.value = "";
   }, []);
 
   const handleSubmit = useCallback(() => {
-    if (pendingFiles.length === 0 || isUploading) return;
-    onUpload(pendingFiles);
-    setPendingFiles([]);
-  }, [pendingFiles, isUploading, onUpload]);
+    if (!pendingFile || isUploading) return;
+    onUpload(pendingFile);
+    setPendingFile(null);
+  }, [pendingFile, isUploading, onUpload]);
 
   const progressLabel = uploadProgress
-    ? `Spracovávam ${uploadProgress.current} / ${uploadProgress.total}…`
-    : "Spracovanie dokladov…";
+    ? `Spracovávam ${uploadProgress.current} / ${uploadProgress.total} dokladov…`
+    : "Rozbaľujem ZIP a spracovávam doklady…";
 
   return (
     <div className="space-y-3">
@@ -98,12 +77,12 @@ export function UploadZone({ onUpload, isUploading, uploadProgress }: UploadZone
                 </>
               ) : (
                 <>
-                  <UploadCloud className="w-10 h-10 text-muted-foreground mb-3" />
+                  <Archive className="w-10 h-10 text-muted-foreground mb-3" />
                   <p className="mb-1 text-sm font-medium text-foreground">
-                    Potiahnite súbory sem alebo kliknite pre výber
+                    Potiahnite ZIP súbor sem alebo kliknite pre výber
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    JPG alebo PNG — môžete vybrať viacero dokladov naraz
+                    ZIP archív s JPG/PNG dokladmi — spracujeme všetky naraz
                   </p>
                 </>
               )}
@@ -112,8 +91,7 @@ export function UploadZone({ onUpload, isUploading, uploadProgress }: UploadZone
               ref={inputRef}
               type="file"
               className="hidden"
-              accept="image/jpeg,image/png"
-              multiple
+              accept=".zip,application/zip"
               onChange={handleChange}
               disabled={isUploading}
               data-testid="input-file-upload"
@@ -122,44 +100,39 @@ export function UploadZone({ onUpload, isUploading, uploadProgress }: UploadZone
         </CardContent>
       </Card>
 
-      {pendingFiles.length > 0 && (
+      {pendingFile && (
         <Card>
-          <CardContent className="p-4 space-y-2">
-            <div className="flex items-center justify-between mb-1">
-              <span className="text-sm font-medium text-foreground">
-                Vybrané súbory
-                <Badge variant="secondary" className="ml-2">{pendingFiles.length}</Badge>
-              </span>
-              <button
-                onClick={handleSubmit}
-                disabled={isUploading}
-                className="px-4 py-1.5 text-sm font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
-                data-testid="button-process"
-              >
-                Spracovať
-              </button>
-            </div>
-            <ul className="space-y-1 max-h-40 overflow-y-auto pr-1">
-              {pendingFiles.map((f) => (
-                <li
-                  key={f.name}
-                  className="flex items-center gap-2 text-xs text-muted-foreground bg-muted/40 rounded px-2 py-1"
+          <CardContent className="p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <Archive className="w-5 h-5 text-primary shrink-0" />
+                <div className="min-w-0">
+                  <p className="text-sm font-medium truncate" title={pendingFile.name}>
+                    {pendingFile.name}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {(pendingFile.size / 1024 / 1024).toFixed(1)} MB
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={() => setPendingFile(null)}
+                  className="text-muted-foreground hover:text-destructive transition-colors"
+                  aria-label="Odstrániť"
                 >
-                  <FileImage className="w-3.5 h-3.5 shrink-0 text-primary" />
-                  <span className="truncate flex-1" title={f.name}>{f.name}</span>
-                  <span className="shrink-0 text-muted-foreground/60">
-                    {(f.size / 1024).toFixed(0)} kB
-                  </span>
-                  <button
-                    onClick={() => removeFile(f.name)}
-                    className="ml-1 text-muted-foreground hover:text-destructive transition-colors"
-                    aria-label="Odstrániť"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                </li>
-              ))}
-            </ul>
+                  <X className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={handleSubmit}
+                  disabled={isUploading}
+                  className="px-4 py-1.5 text-sm font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+                  data-testid="button-process"
+                >
+                  Spracovať
+                </button>
+              </div>
+            </div>
           </CardContent>
         </Card>
       )}

@@ -24,14 +24,14 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 30 * 1024 * 1024 },
+  limits: { fileSize: 200 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    const allowed = [".jpg", ".jpeg", ".png"];
+    const allowed = [".jpg", ".jpeg", ".png", ".zip"];
     const ext = path.extname(file.originalname).toLowerCase();
     if (allowed.includes(ext)) {
       cb(null, true);
     } else {
-      cb(new Error("Podporované sú iba JPG a PNG súbory."));
+      cb(new Error("Podporované sú iba ZIP archívy alebo JPG/PNG súbory."));
     }
   },
 });
@@ -131,16 +131,62 @@ function buildSummaryName(files: Express.Multer.File[]): string {
   return `${files[0].originalname} (+${files.length - 1} ďalších)`;
 }
 
+async function extractZipImages(zipPath: string, destDir: string): Promise<string[]> {
+  return new Promise((resolve, reject) => {
+    const script = `
+import sys, zipfile, pathlib, os
+
+zip_path = sys.argv[1]
+dest_dir = pathlib.Path(sys.argv[2])
+dest_dir.mkdir(parents=True, exist_ok=True)
+exts = {'.jpg', '.jpeg', '.png'}
+extracted = []
+with zipfile.ZipFile(zip_path, 'r') as z:
+    for info in z.infolist():
+        if info.is_dir():
+            continue
+        name = pathlib.Path(info.filename)
+        if name.suffix.lower() not in exts:
+            continue
+        # flatten — use only the filename, avoid path traversal
+        safe_name = name.name
+        out_path = dest_dir / safe_name
+        # deduplicate names
+        counter = 1
+        while out_path.exists():
+            out_path = dest_dir / f"{name.stem}_{counter}{name.suffix}"
+            counter += 1
+        with z.open(info) as src, open(out_path, 'wb') as dst:
+            dst.write(src.read())
+        extracted.append(str(out_path))
+print('\\n'.join(extracted))
+`;
+    const py = spawn("python3", ["-c", script, zipPath, destDir]);
+    let stdout = "";
+    let stderr = "";
+    py.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    py.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    py.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`Rozbalenie ZIP zlyhalo: ${stderr.slice(-300)}`));
+        return;
+      }
+      const files = stdout.split("\n").map(l => l.trim()).filter(Boolean);
+      if (files.length === 0) {
+        reject(new Error("ZIP neobsahuje žiadne JPG/PNG obrázky."));
+        return;
+      }
+      resolve(files);
+    });
+    py.on("error", reject);
+  });
+}
+
 router.post(
   "/ocr/process",
-  upload.fields([
-    { name: "file", maxCount: 1 },
-    { name: "files", maxCount: 20 },
-  ]),
+  upload.single("file"),
   async (req: Request, res: Response) => {
-    const uploadedFiles = collectUploadedFiles(req);
-
-    if (uploadedFiles.length === 0) {
+    if (!req.file) {
       res.status(400).json({ error: "Žiadny súbor nebol nahraný." });
       return;
     }
@@ -148,24 +194,29 @@ router.post(
     const jobId = uuidv4();
     const excelPath = path.join(EXCEL_DIR, `${jobId}.xlsx`);
     const t0 = Date.now();
+    const uploadedFile = req.file;
+    const isZip = path.extname(uploadedFile.originalname).toLowerCase() === ".zip";
+    const extractDir = path.join(UPLOAD_DIR, jobId);
 
     const allRows: unknown[] = [];
     let totalReceipts = 0;
     let validReceipts = 0;
-    const tempExcelPaths: string[] = [];
+    let imageFiles: string[] = [];
 
     try {
-      for (let i = 0; i < uploadedFiles.length; i++) {
-        const file = uploadedFiles[i];
-        const tempExcel = path.join(EXCEL_DIR, `${jobId}_part${i}.xlsx`);
-        tempExcelPaths.push(tempExcel);
+      if (isZip) {
+        imageFiles = await extractZipImages(uploadedFile.path, extractDir);
+      } else {
+        imageFiles = [uploadedFile.path];
+      }
 
-        const result = await runOcrScript(file.path, tempExcel);
+      for (let i = 0; i < imageFiles.length; i++) {
+        const imgPath = imageFiles[i];
+        const tempExcel = path.join(EXCEL_DIR, `${jobId}_part${i}.xlsx`);
+        const result = await runOcrScript(imgPath, tempExcel);
         allRows.push(...result.rows);
         totalReceipts += result.totalReceipts;
         validReceipts += result.validReceipts;
-
-        try { fs.unlinkSync(file.path); } catch {}
         try { fs.unlinkSync(tempExcel); } catch {}
       }
 
@@ -173,8 +224,8 @@ router.post(
 
       const record: JobRecord = {
         jobId,
-        fileName: buildSummaryName(uploadedFiles),
-        fileCount: uploadedFiles.length,
+        fileName: uploadedFile.originalname,
+        fileCount: imageFiles.length,
         totalReceipts,
         validReceipts,
         processedAt: new Date().toISOString(),
@@ -194,16 +245,13 @@ router.post(
         processingTimeMs: record.processingTimeMs,
       });
     } catch (err) {
-      for (const f of uploadedFiles) {
-        try { fs.unlinkSync(f.path); } catch {}
-      }
-      req.log.error({ err }, "OCR batch processing failed");
+      req.log.error({ err }, "OCR processing failed");
       res.status(500).json({
-        error:
-          err instanceof Error
-            ? err.message
-            : "Neznáma chyba pri spracovaní.",
+        error: err instanceof Error ? err.message : "Neznáma chyba pri spracovaní.",
       });
+    } finally {
+      try { fs.unlinkSync(uploadedFile.path); } catch {}
+      try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch {}
     }
   },
 );
