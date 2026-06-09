@@ -1,30 +1,15 @@
-modules = ["nodejs-24", "python-3.11"]
-
-[deployment]
-router = "application"
-deploymentTarget = "autoscale"
-
-[deployment.postBuild]
-args = ["pnpm", "store", "prune"]
-env = { "CI" = "true" }
+run = "./start_streamlit.sh"
+modules = ["python-3.11", "nodejs-20"]
 
 [workflows]
 runButton = "Project"
-
-[agent]
-stack = "PNPM_WORKSPACE"
-expertMode = true
-
-[postMerge]
-path = "scripts/post-merge.sh"
-timeoutMs = 20000
 
 [[ports]]
 localPort = 8080
 externalPort = 8080
 
 [[ports]]
-localPort = 8081
+localPort = 8501
 externalPort = 80
 
 [[ports]]
@@ -33,3 +18,6 @@ externalPort = 3000
 
 [nix]
 channel = "stable-25_05"
+
+[agent]
+expertMode = true
