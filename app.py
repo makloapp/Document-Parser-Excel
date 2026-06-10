@@ -237,9 +237,9 @@ def frame_sharpness(frame):
 def extract_receipt_frames_from_video(
     video_path,
     output_dir,
-    sample_fps=2.0,
-    stable_diff_threshold=4.5,
-    min_stable_seconds=0.8,
+    sample_fps=4.0,
+    stable_diff_threshold=12.0,
+    min_stable_seconds=0.5,
     min_gap_seconds=1.5,
     max_frames=80
 ):
@@ -411,9 +411,9 @@ else:
     )
 
     with st.expander("Nastavenia delenia videa"):
-        sample_fps = st.slider("Koľkokrát za sekundu kontrolovať video", 1.0, 5.0, 2.0, 0.5)
-        stable_diff_threshold = st.slider("Citlivosť zastavenia kamery", 1.0, 15.0, 4.5, 0.5)
-        min_stable_seconds = st.slider("Minimálna dĺžka zastavenia nad bločkom", 0.3, 3.0, 0.8, 0.1)
+        sample_fps = st.slider("Koľkokrát za sekundu kontrolovať video", 1.0, 8.0, 4.0, 0.5)
+        stable_diff_threshold = st.slider("Citlivosť zastavenia kamery", 1.0, 35.0, 12.0, 0.5)
+        min_stable_seconds = st.slider("Minimálna dĺžka zastavenia nad bločkom", 0.2, 3.0, 0.5, 0.1)
         min_gap_seconds = st.slider("Minimálny odstup medzi dvoma bločkami", 0.5, 5.0, 1.5, 0.1)
         max_frames = st.slider("Maximálny počet vybraných bločkov z videa", 5, 200, 80, 5)
 
