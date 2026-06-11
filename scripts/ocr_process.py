@@ -679,11 +679,6 @@ def find_date(text):
                 f"{day_i:02d}.{month_i:02d}.{year_i:04d}",
             ))
 
-    for _, rd, rm, ry, rfmt in reversed(regular_dates):
-        for _, cd, cm, cy, cfmt in compact_dates:
-            if rd == cd and rm == cm and cy != ry:
-                return cfmt
-
     if regular_dates:
         regular_dates.sort(key=lambda item: item[0])
         return regular_dates[-1][4]
@@ -745,6 +740,37 @@ def find_payment_total(text):
 
             if 0.10 <= payment <= 100000:
                 return payment, f"{cash_line} | {change_line} | hotovosť - vrátené"
+
+    direct_payment_candidates = []
+
+    for idx, line in enumerate(lines):
+        norm = _normalize_text(line)
+
+        values = [
+            round(v, 2)
+            for v in parse_money_values(line)
+            if 0.10 <= v <= 100000
+        ]
+
+        if not values:
+            continue
+
+        priority = 0
+
+        if any(tok in norm for tok in ["uhradene", "uhradit", "na uhradu", "uhrada"]):
+            priority = 320
+        elif "suma:" in norm or norm.strip().startswith("suma"):
+            priority = 300
+        elif "cena celkom" in norm:
+            priority = 240
+
+        if priority:
+            direct_payment_candidates.append((priority, idx, values[-1], line))
+
+    if direct_payment_candidates:
+        direct_payment_candidates.sort(key=lambda item: (-item[0], item[1]))
+        _priority, _idx, value, source_line = direct_payment_candidates[0]
+        return value, f"{source_line} | priamy zdroj úhrady"
 
     keyword_weights = [
         ("uhradene eur", 240), ("uhradene", 235),
@@ -918,6 +944,69 @@ def find_rounding_amount(text):
     return 0.0, ""
 
 
+
+def find_gross_total_before_rounding(text):
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not _is_debug_line(line)
+    ]
+
+    candidates = []
+
+    for idx, line in enumerate(lines):
+        norm = _normalize_text(line)
+
+        values = [
+            round(v, 2)
+            for v in parse_money_values(line)
+            if 0.10 <= v <= 100000
+        ]
+
+        if not values:
+            continue
+
+        score = 0
+
+        if "pred zaokruhlenim" in norm or "pred zaokr" in norm:
+            score = 360
+        elif "cena celkom" in norm:
+            score = 310
+        elif "rekapitulacia obratu" in norm:
+            score = 300
+        elif "obrat" in norm:
+            score = 290
+        elif norm.startswith("spolu") or " spolu:" in norm:
+            score = 260
+        elif "sadzby" in norm or "sadzba" in norm or "triedy" in norm:
+            score = 220
+
+        if score == 0:
+            continue
+
+        # Riadky platby nie sú Spolu s DPH pred zaokrúhlením.
+        if any(tok in norm for tok in [
+            "uhradene",
+            "uhradit",
+            "na uhradu",
+            "hotovost",
+            "vratene",
+            "vydavok",
+        ]) and "pred zaokruhlenim" not in norm:
+            continue
+
+        # Berieme najväčšiu kladnú sumu z riadku.
+        value = max(values)
+
+        candidates.append((score, idx, value, line))
+
+    if candidates:
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        _score, _idx, value, source_line = candidates[0]
+        return value, source_line
+
+    return None, ""
+
 def _extract_vat_line_candidates(line, total=None, rounding=0.0, prev_norm=""):
     if _is_debug_line(line):
         return []
@@ -1074,6 +1163,16 @@ def find_vat_table(text, total=None):
     if payment_total is not None:
         total = payment_total
     rounding, rounding_source = find_rounding_amount(text)
+
+    gross_total, gross_source = find_gross_total_before_rounding(text)
+
+    if gross_total is not None and payment_total is not None:
+        calculated_rounding = round(float(payment_total) - float(gross_total), 2)
+        if abs(calculated_rounding) <= 0.10:
+            rounding = calculated_rounding
+            if not rounding_source:
+                rounding_source = "zaokrúhlenie dopočítané z úhrady a sumy pred zaokrúhlením"
+
     best = {"zaklad_dph": None, "dph": None, "obrat_dph": None, "zaokruhlenie": rounding, "spolu_s_dph": total, "sadzba_dph": "", "payment_total": total, "payment_source": payment_source, "rounding_source": rounding_source, "vat_source": ""}
     candidate_rows = []
     for idx, line in enumerate(lines):
@@ -1152,6 +1251,36 @@ def find_vat_table(text, total=None):
         best["sadzba_dph"] = "23 %"
         best["vat_source"] = f"DPH z bloku: {selected['source_line']}"
         return best
+    if gross_total is not None:
+        gross_total = round(float(gross_total), 2)
+
+        if total is None:
+            total = round(gross_total + float(rounding or 0.0), 2)
+
+        payment_total = round(float(total), 2)
+
+        text_norm = _normalize_text(text)
+
+        if "23" in text_norm:
+            zaklad_dph = round(gross_total / 1.23, 2)
+            dph = round(gross_total - zaklad_dph, 2)
+
+            best["zaklad_dph"] = zaklad_dph
+            best["dph"] = dph
+            best["obrat_dph"] = gross_total
+            best["spolu_s_dph"] = gross_total
+            best["payment_total"] = payment_total
+            best["zaokruhlenie"] = round(payment_total - gross_total, 2)
+            best["sadzba_dph"] = "23 %"
+            best["vat_source"] = f"DPH dopočítaná z 23 % a Spolu s DPH: {gross_source}"
+            return best
+
+        best["spolu_s_dph"] = gross_total
+        best["payment_total"] = payment_total
+        best["zaokruhlenie"] = round(payment_total - gross_total, 2)
+        best["vat_source"] = f"DPH sa nepodarilo prečítať, Spolu s DPH: {gross_source}"
+        return best
+
     if total is not None:
         payment_total = round(float(total), 2)
         gross_total = round(payment_total - float(rounding or 0.0), 2)
