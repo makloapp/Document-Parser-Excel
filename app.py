@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_11.06.2026_11:40"
+APP_VERSION = "v_11.06.2026_13:03"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -551,6 +551,15 @@ else:
             key="download_blocks_zip_persistent"
         )
 
+    if st.session_state.get("last_output_excel"):
+        st.download_button(
+            label=f"Znova stiahnuť posledný výstupný Excel ({st.session_state.get('last_output_excel_count', '?')} riadkov)",
+            data=st.session_state["last_output_excel"],
+            file_name=st.session_state.get("last_output_excel_name", "doklady_vystup.xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_output_excel_persistent"
+        )
+
     if uploaded_videos:
         import hashlib
 
@@ -659,4 +668,17 @@ else:
                             st.image(str(file_item["path"]), caption=file_item["original_name"], use_container_width=True)
 
                     results, excel_files = run_ocr_for_files(all_input_files, tmpdir)
+
+                    output_excel = create_combined_excel(
+                        excel_files,
+                        one_row_per_source=True
+                    )
+
+                    if hasattr(output_excel, "getvalue"):
+                        output_excel = output_excel.getvalue()
+
+                    st.session_state["last_output_excel"] = output_excel
+                    st.session_state["last_output_excel_name"] = "doklady_vystup.xlsx"
+                    st.session_state["last_output_excel_count"] = len(results)
+
                     show_results_and_download(results, excel_files, one_row_per_source=True)
