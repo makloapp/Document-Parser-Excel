@@ -634,6 +634,33 @@ def find_date(text):
         ]):
             line_priority = 120
 
+        technical_code_line = any(tok in norm_line for tok in [
+            "ekasa",
+            "e-kasa",
+            "uid",
+            "okp",
+            "pkp",
+            "dkp",
+            "ikp",
+            "kp:",
+            "kod",
+            "kód",
+            "ico",
+            "ičo",
+            "dic",
+            "dič",
+            "ic dph",
+            "ič dph",
+            "poradove cislo",
+            "poradové číslo",
+            "cislo dokladu",
+            "číslo dokladu",
+        ])
+
+        if technical_code_line and not line_priority:
+            offset += len(raw_line) + 1
+            continue
+
         segment = raw_line
 
         if line_priority and idx + 1 < len(lines):
@@ -759,7 +786,10 @@ def find_payment_total(text):
 
         if any(tok in norm for tok in ["uhradene", "uhradit", "na uhradu", "uhrada"]):
             priority = 320
-        elif "suma:" in norm or norm.strip().startswith("suma"):
+        elif (
+            ("suma:" in norm or norm.strip().startswith("suma"))
+            and not any(tok in norm for tok in ["dph", "zaklad", "zaktad", "sadzba", "obrat"])
+        ):
             priority = 300
         elif "cena celkom" in norm:
             priority = 240
@@ -826,11 +856,26 @@ def find_payment_total(text):
             "kartou:",
         ])
 
+        is_vat_table_source = (
+            any(tok in norm_source for tok in [
+                "zaklad",
+                "zaktad",
+                "sadzba",
+                "sadzby",
+                "dph",
+                "oph",
+                "obrat",
+                "rekapitulacia",
+                "triedy",
+            ])
+            and not is_real_payment_line
+        )
+
         for value in values:
             if value <= 0:
                 continue
 
-            if is_item_line and not is_real_payment_line:
+            if (is_item_line or is_vat_table_source) and not is_real_payment_line:
                 continue
 
             repeat_bonus = min(counts[value], 4) * 18
@@ -1112,6 +1157,32 @@ def _extract_vat_line_candidates(line, total=None, rounding=0.0, prev_norm=""):
             elif pay_diff > max(0.50, total * 0.05):
                 score -= 180
         candidates.append({"score": score, "zaklad_dph": zaklad, "dph": dph, "obrat_dph": obrat, "spolu_s_dph": round(total, 2) if total is not None else expected_total, "ratio": ratio, "source_line": line, "source_note": f"{source_note}{source_note_extra}"})
+
+    if len(values) == 2 and vat_table_hint:
+        possible_dph = values[0]
+        possible_obrat = values[1]
+        possible_zaklad = round(possible_obrat - possible_dph, 2)
+
+        if possible_zaklad > 0:
+            add_candidate(
+                possible_zaklad,
+                possible_dph,
+                possible_obrat,
+                "DPH tabuľka bez základu - základ dopočítaný"
+            )
+
+    if len(values) >= 3 and vat_table_hint and values[0] < 1:
+        possible_dph = values[-2]
+        possible_obrat = values[-1]
+        possible_zaklad = round(possible_obrat - possible_dph, 2)
+
+        if possible_zaklad > 0:
+            add_candidate(
+                possible_zaklad,
+                possible_dph,
+                possible_obrat,
+                "DPH tabuľka s poškodeným základom - základ dopočítaný"
+            )
 
     if len(values) >= 3:
         for i in range(0, len(values) - 2):
