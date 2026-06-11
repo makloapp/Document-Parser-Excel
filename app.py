@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_11.06.2026_14:04"
+APP_VERSION = "v_11.06.2026_14:15"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -621,7 +621,7 @@ if mode == "ZIP alebo JPG/PDF súbory":
                     else:
                         st.info(f"Počet nájdených dokladov v ZIP: {len(input_files)}")
                         results, excel_files = run_ocr_for_files(input_files, tmpdir)
-                        show_results_and_download(results, excel_files)
+                        show_results_and_download(results, excel_files, one_row_per_source=True)
 
     else:
         uploaded_files = st.file_uploader(
@@ -643,7 +643,7 @@ if mode == "ZIP alebo JPG/PDF súbory":
                         st.error("Nenašli sa podporované súbory.")
                     else:
                         results, excel_files = run_ocr_for_files(input_files, tmpdir)
-                        show_results_and_download(results, excel_files)
+                        show_results_and_download(results, excel_files, one_row_per_source=True)
 
 else:
     st.write("Nahraj video, v ktorom sú bločky snímané zľava doprava. Nad každým bločkom sa na chvíľu zastav.")
