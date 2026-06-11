@@ -530,63 +530,169 @@ def format_eur(value):
 
 
 def find_date(text):
-    patterns = [
-        r"\b(\d{1,2})\s*[.\/-]\s*(\d{1,2})\s*[.\/-]\s*(\d{4})\b",
-        r"\b(\d{1,2})\s*[.\/-]\s*(\d{1,2})\s*[.\/-]\s*(\d{2})\b",
-        r"\b(\d{1,2})\s+(\d{1,2})\s*[.,\/-]\s*(\d{4})\b",
-    ]
-    regular_dates = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text):
+    fuzzy_map = str.maketrans({
+        "O": "0",
+        "o": "0",
+        "Q": "0",
+        "D": "0",
+        "A": "4",
+        "a": "4",
+        "I": "1",
+        "l": "1",
+        "|": "1",
+        "S": "5",
+        "s": "5",
+        "B": "8",
+        "G": "6",
+        "F": "6",
+    })
+
+    def valid_date(day_i, month_i, year_i):
+        return 1 <= day_i <= 31 and 1 <= month_i <= 12 and 2020 <= year_i <= 2099
+
+    def normalize_year(year):
+        year_i = int(year)
+        if len(str(year)) == 2:
+            year_i = 2000 + year_i
+        return year_i
+
+    def extract_dates_from_segment(segment, base_pos=0):
+        found = []
+        converted = segment.translate(fuzzy_map)
+
+        # DD.MM.RRRR / DD-MM-RRRR / DD/MM/RRRR / DD MM RRRR
+        for match in re.finditer(r"\b(\d{1,2})[\s.\/-]+(\d{1,2})[\s.,\/-]+(\d{2,4})\b", converted):
             day, month, year = match.groups()
             try:
                 day_i = int(day)
                 month_i = int(month)
+                year_i = normalize_year(year)
             except ValueError:
                 continue
-            if not (1 <= day_i <= 31 and 1 <= month_i <= 12):
+
+            if valid_date(day_i, month_i, year_i):
+                found.append((
+                    base_pos + match.start(),
+                    day_i,
+                    month_i,
+                    year_i,
+                    f"{day_i:02d}.{month_i:02d}.{year_i:04d}",
+                ))
+
+        # RRRR-MM-DD / RRRR.MM.DD / RRRR/MM/DD
+        for match in re.finditer(r"\b(20\d{2})[\s.\/-]+(\d{1,2})[\s.\/-]+(\d{1,2})\b", converted):
+            year, month, day = match.groups()
+            try:
+                day_i = int(day)
+                month_i = int(month)
+                year_i = int(year)
+            except ValueError:
                 continue
-            if len(year) == 2:
-                year = "20" + year
-            regular_dates.append((match.start(), day_i, month_i, int(year), f"{day_i:02d}.{month_i:02d}.{int(year):04d}"))
-    fuzzy_map = str.maketrans({"O": "0", "o": "0", "Q": "0", "D": "0", "A": "4", "a": "4", "I": "1", "l": "1", "|": "1", "S": "5", "s": "5", "B": "8", "G": "6", "F": "6"})
+
+            if valid_date(day_i, month_i, year_i):
+                found.append((
+                    base_pos + match.start(),
+                    day_i,
+                    month_i,
+                    year_i,
+                    f"{day_i:02d}.{month_i:02d}.{year_i:04d}",
+                ))
+
+        return found
+
+    lines = text.splitlines()
+
+    priority_dates = []
+    regular_dates = []
+
     offset = 0
-    for raw_line in text.splitlines():
+
+    for idx, raw_line in enumerate(lines):
         norm_line = _normalize_text(raw_line)
-        if any(tok in norm_line for tok in ["datum", "datun", "latum", "natum"]):
-            converted = raw_line.translate(fuzzy_map)
-            for match in re.finditer(r"\b(\d{1,2})[\s.\/-]+(\d{1,2})[\s.,\/-]+(\d{2,4})\b", converted):
-                day, month, year = match.groups()
-                try:
-                    day_i = int(day)
-                    month_i = int(month)
-                    year_i = int(year if len(year) == 4 else "20" + year)
-                except ValueError:
-                    continue
-                if 1 <= day_i <= 31 and 1 <= month_i <= 12 and 2020 <= year_i <= 2099:
-                    regular_dates.append((offset + match.start(), day_i, month_i, year_i, f"{day_i:02d}.{month_i:02d}.{year_i:04d}"))
+
+        line_priority = 0
+
+        if any(tok in norm_line for tok in [
+            "datum vyhotovenia",
+            "datun vyhotovenia",
+            "datum vyhot",
+            "vyhotovenia",
+        ]):
+            line_priority = 300
+        elif any(tok in norm_line for tok in [
+            "datum:",
+            "datun:",
+            "datum ",
+            "datun ",
+            "natum ",
+            "latum ",
+        ]):
+            line_priority = 220
+        elif any(tok in norm_line for tok in [
+            "duzp",
+            "datum/duzp",
+        ]):
+            line_priority = 120
+
+        segment = raw_line
+
+        if line_priority and idx + 1 < len(lines):
+            segment = raw_line + " " + lines[idx + 1]
+
+        line_dates = extract_dates_from_segment(segment, offset)
+
+        for item in line_dates:
+            regular_dates.append(item)
+
+            if line_priority:
+                priority_dates.append((line_priority, item[0], item[4]))
+
         offset += len(raw_line) + 1
+
+    if priority_dates:
+        priority_dates.sort(key=lambda item: (-item[0], item[1]))
+        return priority_dates[0][2]
+
     compact_dates = []
-    compact_text = text.translate(str.maketrans({"O": "0", "o": "0", "F": "6", "S": "5", "B": "8", "I": "1", "l": "1"}))
+    compact_text = text.translate(str.maketrans({
+        "O": "0",
+        "o": "0",
+        "F": "6",
+        "S": "5",
+        "B": "8",
+        "I": "1",
+        "l": "1",
+    }))
+
     for match in re.finditer(r"(?<!\d)(2\d)([01]\d)([0-3]\d)\d{3,}(?!\d)", compact_text):
         yy, mm, dd = match.groups()
-        year = 2000 + int(yy)
+        year_i = 2000 + int(yy)
         month_i = int(mm)
         day_i = int(dd)
-        if 1 <= month_i <= 12 and 1 <= day_i <= 31:
-            compact_dates.append((match.start(), day_i, month_i, year, f"{day_i:02d}.{month_i:02d}.{year:04d}"))
+
+        if valid_date(day_i, month_i, year_i):
+            compact_dates.append((
+                match.start(),
+                day_i,
+                month_i,
+                year_i,
+                f"{day_i:02d}.{month_i:02d}.{year_i:04d}",
+            ))
+
     for _, rd, rm, ry, rfmt in reversed(regular_dates):
         for _, cd, cm, cy, cfmt in compact_dates:
             if rd == cd and rm == cm and cy != ry:
                 return cfmt
+
     if regular_dates:
         regular_dates.sort(key=lambda item: item[0])
         return regular_dates[-1][4]
+
     if compact_dates:
         compact_dates.sort(key=lambda item: item[0])
         return compact_dates[0][4]
-    return ""
 
+    return ""
 
 def _all_money_counter(text):
     values = []
@@ -656,7 +762,7 @@ def find_payment_total(text):
         ("karta", 100), ("kartou", 100),
         ("hotovost", 82), ("hotovost:", 82), ("hotovosf", 75),
         ("rozpis platie", 45),
-        ("spolu", 35), ("suma", 25),
+        ("suma:", 220), ("suma", 190), ("spolu", 35),
     ]
     candidates = []
     document_has_change = any(any(tok in _normalize_text(line) for tok in ["vratene", "vraten", "vratit", "vydavok", "vydane"]) for line in lines)
@@ -687,6 +793,7 @@ def find_payment_total(text):
             "cena celkom",
             "ciastka",
             "clastka",
+            "suma",
             "hotovost:",
             "hotovosf:",
             "karta:",
@@ -914,7 +1021,7 @@ def _extract_vat_line_candidates(line, total=None, rounding=0.0, prev_norm=""):
             elif pay_diff <= 0.20:
                 score += 30
             elif pay_diff > max(0.50, total * 0.05):
-                score -= 25
+                score -= 180
         candidates.append({"score": score, "zaklad_dph": zaklad, "dph": dph, "obrat_dph": obrat, "spolu_s_dph": round(total, 2) if total is not None else expected_total, "ratio": ratio, "source_line": line, "source_note": f"{source_note}{source_note_extra}"})
 
     if len(values) >= 3:
@@ -922,18 +1029,41 @@ def _extract_vat_line_candidates(line, total=None, rounding=0.0, prev_norm=""):
             add_candidate(values[i], values[i + 1], values[i + 2], "riadok obsahuje základ, DPH/daň a obrat")
         add_candidate(values[-3], values[-2], values[-1], "riadok obsahuje základ, DPH/daň a obrat")
 
-    for i, zaklad in enumerate(values):
-        for j, dph in enumerate(values):
-            if i == j:
-                continue
-            if zaklad <= 0 or dph <= 0:
-                continue
-            if zaklad < dph:
-                continue
-            ratio = dph / zaklad
-            if not (0.18 <= ratio <= 0.30):
-                continue
-            add_candidate(zaklad, dph, None, "základ a DPH z riadku")
+    has_valid_triple_candidate = len(values) >= 3 and bool(candidates)
+
+    strict_vat_triple_context = (
+        len(values) >= 3
+        and any(tok in norm or tok in prev_norm for tok in [
+            "sadzba",
+            "sadzby",
+            "zaklad",
+            "zaktad",
+            "dph",
+            "oph",
+            "dan",
+            "nan",
+            "obrat",
+            "spolu",
+            "triedy",
+            "rekapitulacia",
+        ])
+    )
+
+    if has_valid_triple_candidate or strict_vat_triple_context:
+        return candidates
+
+        for i, zaklad in enumerate(values):
+            for j, dph in enumerate(values):
+                if i == j:
+                    continue
+                if zaklad <= 0 or dph <= 0:
+                    continue
+                if zaklad < dph:
+                    continue
+                ratio = dph / zaklad
+                if not (0.18 <= ratio <= 0.30):
+                    continue
+                add_candidate(zaklad, dph, None, "základ a DPH z riadku")
 
     return candidates
 
