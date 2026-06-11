@@ -773,6 +773,74 @@ def find_date_source_debug(text):
     return f"zdroj dátumu sa nenašiel v riadkoch, hodnota: {date_value}"
 
 
+def find_all_date_candidates_debug(text):
+    """Vypíše všetky bežné dátumy nájdené v OCR texte po riadkoch."""
+    found = []
+
+    fuzzy_map = str.maketrans({
+        "O": "0",
+        "o": "0",
+        "Q": "0",
+        "D": "0",
+        "A": "4",
+        "a": "4",
+        "I": "1",
+        "l": "1",
+        "|": "1",
+        "S": "5",
+        "s": "5",
+        "B": "8",
+        "G": "6",
+        "F": "6",
+    })
+
+    def add_candidate(value, line_no, raw_line):
+        item = f"{value} | riadok {line_no}: {raw_line.strip()}"
+        if item not in found:
+            found.append(item)
+
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        if not raw_line.strip():
+            continue
+
+        converted = raw_line.translate(fuzzy_map)
+
+        # DD.MM.RRRR / DD-MM-RRRR / DD/MM/RRRR aj s medzerami
+        for m in re.finditer(r"\b(\d{1,2})[\s.\/-]+(\d{1,2})[\s.,\/-]+(\d{2,4})\b", converted):
+            day, month, year = m.groups()
+
+            try:
+                day_i = int(day)
+                month_i = int(month)
+                year_i = int(year)
+                if year_i < 100:
+                    year_i += 2000
+            except ValueError:
+                continue
+
+            if 1 <= day_i <= 31 and 1 <= month_i <= 12 and 2020 <= year_i <= 2099:
+                add_candidate(f"{day_i:02d}.{month_i:02d}.{year_i:04d}", line_no, raw_line)
+
+        # RRRR-MM-DD / RRRR.MM.DD / RRRR/MM/DD
+        for m in re.finditer(r"\b(20\d{2})[\s.\/-]+(\d{1,2})[\s.\/-]+(\d{1,2})\b", converted):
+            year, month, day = m.groups()
+
+            try:
+                day_i = int(day)
+                month_i = int(month)
+                year_i = int(year)
+            except ValueError:
+                continue
+
+            if 1 <= day_i <= 31 and 1 <= month_i <= 12 and 2020 <= year_i <= 2099:
+                add_candidate(f"{day_i:02d}.{month_i:02d}.{year_i:04d}", line_no, raw_line)
+
+    if not found:
+        return "nenašiel sa žiadny bežný dátum v OCR texte"
+
+    return " || ".join(found)
+
+
 def _all_money_counter(text):
     values = []
     for line in text.splitlines():
@@ -1501,6 +1569,7 @@ def parse_receipt_text(text, receipt_id, file_name):
         "stav": "OK",
         "datumVystavenia": find_date(text),
         "dateSource": find_date_source_debug(text),
+        "dateCandidates": find_all_date_candidates_debug(text),
         "sadzbaDph": vat["sadzba_dph"],
         "zakladDph": format_eur(vat["zaklad_dph"]),
         "dph": format_eur(vat["dph"]),
@@ -1530,6 +1599,7 @@ def make_not_found_row(file_name):
         "stav": "blok nenajdeny",
         "datumVystavenia": "",
         "dateSource": "",
+        "dateCandidates": "",
         "sadzbaDph": "",
         "zakladDph": None,
         "dph": None,
@@ -1691,6 +1761,7 @@ def save_excel(rows, output_path: Path):
             "Zdroj DPH": row.get("vatSource", ""),
             "Zdroj zaokrúhlenia": row.get("roundingSource", ""),
             "Zdroj dátumu": row.get("dateSource", ""),
+            "Všetky dátumy OCR": row.get("dateCandidates", ""),
         })
     df = pd.DataFrame(excel_rows)
     visible_cols = [
@@ -1720,6 +1791,7 @@ def save_excel(rows, output_path: Path):
         ws["Q1"] = "Zdroj DPH"
         ws["R1"] = "Zdroj zaokrúhlenia"
         ws["S1"] = "Zdroj dátumu"
+        ws["T1"] = "Všetky dátumy OCR"
 
         tolerance = 0.02
 
@@ -1783,6 +1855,7 @@ def save_excel(rows, output_path: Path):
                 ws[f"Q{row_idx}"] = df.iloc[data_idx].get("Zdroj DPH", "")
                 ws[f"R{row_idx}"] = df.iloc[data_idx].get("Zdroj zaokrúhlenia", "")
                 ws[f"S{row_idx}"] = df.iloc[data_idx].get("Zdroj dátumu", "")
+                ws[f"T{row_idx}"] = df.iloc[data_idx].get("Všetky dátumy OCR", "")
 
         widths = {
             "A": 34,
@@ -1804,6 +1877,7 @@ def save_excel(rows, output_path: Path):
             "Q": 80,
             "R": 55,
             "S": 70,
+            "T": 100,
         }
 
         for col, width in widths.items():
