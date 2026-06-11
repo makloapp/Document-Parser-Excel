@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_11.06.2026_10:35"
+APP_VERSION = "v_11.06.2026_10:52"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -543,7 +543,49 @@ else:
         )
 
     if uploaded_videos:
-        st.info(f"Počet nahraných video súborov: {len(uploaded_videos)}")
+        import hashlib
+
+        video_items = []
+        seen_hashes = {}
+
+        for video_index, uploaded_video in enumerate(uploaded_videos, start=1):
+            video_bytes = uploaded_video.getvalue()
+            video_hash = hashlib.sha1(video_bytes).hexdigest()[:10]
+
+            original_name = uploaded_video.name or f"video_{video_index:02d}.mp4"
+            video_suffix = Path(original_name).suffix.lower() or ".mp4"
+
+            safe_video_stem = Path(original_name).stem
+            safe_video_stem = "".join(ch if ch.isalnum() or ch in ["-", "_"] else "_" for ch in safe_video_stem)
+            safe_video_stem = safe_video_stem[:60] or f"video_{video_index:02d}"
+
+            video_items.append({
+                "index": video_index,
+                "name": original_name,
+                "suffix": video_suffix,
+                "safe_stem": safe_video_stem,
+                "bytes": video_bytes,
+                "size": len(video_bytes),
+                "hash": video_hash,
+            })
+
+            seen_hashes.setdefault(video_hash, []).append(original_name)
+
+        st.info(f"Počet nahraných video súborov: {len(video_items)}")
+
+        with st.expander("Kontrola nahraných videí"):
+            for item in video_items:
+                st.write(
+                    f'{item["index"]}. {item["name"]} | '
+                    f'{item["size"] / (1024 * 1024):.2f} MB | '
+                    f'ID: {item["hash"]}'
+                )
+
+            duplicate_groups = [names for names in seen_hashes.values() if len(names) > 1]
+            if duplicate_groups:
+                st.warning("Niektoré nahrané videá majú rovnaký obsah. Skontroluj, či nebol rovnaký súbor nahraný viackrát.")
+                for names in duplicate_groups:
+                    st.write(", ".join(names))
 
         if st.button("Spracovať VIDEO"):
             with tempfile.TemporaryDirectory() as tmpdir_raw:
@@ -551,18 +593,16 @@ else:
 
                 all_input_files = []
 
-                for video_index, uploaded_video in enumerate(uploaded_videos, start=1):
-                    video_suffix = Path(uploaded_video.name).suffix.lower()
-                    safe_video_stem = Path(uploaded_video.name).stem
-                    safe_video_stem = "".join(ch if ch.isalnum() or ch in ["-", "_"] else "_" for ch in safe_video_stem)
-                    video_prefix = f"video_{video_index:02d}_{safe_video_stem}"
+                for item in video_items:
+                    video_index = item["index"]
+                    video_prefix = f'video_{video_index:02d}_{item["hash"]}_{item["safe_stem"]}'
 
-                    video_path = tmpdir / f"{video_prefix}{video_suffix}"
-                    video_path.write_bytes(uploaded_video.getbuffer())
+                    video_path = tmpdir / f'{video_prefix}{item["suffix"]}'
+                    video_path.write_bytes(item["bytes"])
 
                     extracted_dir = tmpdir / "video_jpg" / video_prefix
 
-                    with st.spinner(f"Rozdeľujem video {video_index}/{len(uploaded_videos)}: {uploaded_video.name}"):
+                    with st.spinner(f'Rozdeľujem video {video_index}/{len(video_items)}: {item["name"]}'):
                         try:
                             input_files = extract_receipt_frames_from_video(
                                 video_path=video_path,
@@ -576,18 +616,18 @@ else:
                                 video_prefix=video_prefix
                             )
                         except Exception as e:
-                            st.error(f"Video sa nepodarilo rozdeliť: {uploaded_video.name} — {e}")
+                            st.error(f'Video sa nepodarilo rozdeliť: {item["name"]} — {e}')
                             input_files = []
 
                     if not input_files:
-                        st.warning(f"Z videa {uploaded_video.name} sa nepodarilo vybrať žiadne stabilné zábery.")
+                        st.warning(f'Z videa {item["name"]} sa nepodarilo vybrať žiadne stabilné zábery.')
                     else:
-                        st.success(f"Z videa {uploaded_video.name} bolo vybraných {len(input_files)} JPG záberov.")
+                        st.success(f'Z videa {item["name"]} bolo vybraných {len(input_files)} JPG záberov.')
                         all_input_files.extend(input_files)
 
                 if not all_input_files:
                     st.error("Zo žiadneho videa sa nepodarilo vybrať stabilné zábery.")
-                    st.write("Skús video, kde sa nad každým bločkom zastavíš dlhšie, alebo zvýš citlivosť zastavenia.")
+                    st.write("Skús video, kde sa nad každým bločkom zastavíš dlhšie, alebo uprav citlivosť zastavenia.")
                 else:
                     st.success(f"Celkovo bolo vybraných {len(all_input_files)} JPG záberov zo všetkých videí.")
 
