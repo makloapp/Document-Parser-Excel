@@ -600,7 +600,52 @@ def _all_money_counter(text):
 def find_payment_total(text):
     lines = [line.strip() for line in text.splitlines() if line.strip() and not _is_debug_line(line)]
     counts = _all_money_counter(text)
+
+    change_tokens = ["vratene", "vraten", "vratit", "vydavok", "vydane"]
+    cash_tokens = ["hotovost", "hotovosf"]
+
+    # Ak je na bločku HOTOVOSŤ a potom VRÁTENÉ,
+    # reálna suma na úhradu je HOTOVOSŤ - VRÁTENÉ.
+    cash_rows = []
+    change_rows = []
+
+    for idx, line in enumerate(lines):
+        norm = _normalize_text(line)
+        values = [
+            round(v, 2)
+            for v in parse_money_values(line)
+            if 0.10 <= abs(v) <= 100000
+        ]
+
+        if not values:
+            continue
+
+        if any(tok in norm for tok in cash_tokens):
+            cash_rows.append((idx, abs(values[-1]), line))
+
+        if any(tok in norm for tok in change_tokens):
+            change_rows.append((idx, abs(values[-1]), line))
+
+    for cash_idx, cash_value, cash_line in cash_rows:
+        nearby_changes = [
+            (change_idx, change_value, change_line)
+            for change_idx, change_value, change_line in change_rows
+            if cash_idx <= change_idx <= cash_idx + 6
+        ]
+
+        if nearby_changes:
+            change_idx, change_value, change_line = nearby_changes[0]
+            payment = round(cash_value - change_value, 2)
+
+            if 0.10 <= payment <= 100000:
+                return payment, f"{cash_line} | {change_line} | hotovosť - vrátené"
+
     keyword_weights = [
+        ("uhradene eur", 240), ("uhradene", 235),
+        ("uhradit eur", 235), ("uhradit", 230),
+        ("na uhradu", 230), ("na ohradu", 220), ("nauhradu", 220), ("naohradu", 215),
+        ("uhradu eur", 220), ("ohradu eur", 210),
+        ("uhrada eur", 215), ("uhrada", 210),
         ("ciastka eur", 180), ("ciastka:", 180), ("ciastka", 170), ("clastka", 160), ("ciastka, eur", 170),
         ("na uhradu", 155), ("na ohradu", 150), ("nauhradu", 150), ("naohradu", 150),
         ("uhradu eur", 150), ("ohradu eur", 145),
@@ -614,7 +659,7 @@ def find_payment_total(text):
         ("spolu", 35), ("suma", 25),
     ]
     candidates = []
-    document_has_change = any(any(tok in _normalize_text(line) for tok in ["vratene", "vraten", "vydavok", "vydane"]) for line in lines)
+    document_has_change = any(any(tok in _normalize_text(line) for tok in ["vratene", "vraten", "vratit", "vydavok", "vydane"]) for line in lines)
 
     def add_candidates_from_line(idx, line, base_weight, source_line):
         values = [round(v, 2) for v in parse_money_values(line) if 0.10 <= abs(v) <= 100000]
@@ -628,14 +673,14 @@ def find_payment_total(text):
             value_count = len(values)
             if document_has_change and any(tok in norm_source for tok in ["hotovost", "hotovosf"]):
                 score -= 95
-            if any(tok in norm_source for tok in ["vratene", "vraten", "vydavok", "vydane"]):
+            if any(tok in norm_source for tok in ["vratene", "vraten", "vratit", "vydavok", "vydane"]):
                 score -= 180
             if any(tok in norm_source for tok in ["celkom", "clkom", "cekkom", "ceikom"]) and "cena celkom" not in norm_source:
                 if value_count == 1:
                     score += 70
                 elif value_count >= 2:
                     score -= 90
-            if any(tok in norm_source for tok in ["rekapitulacia", "sadzba", "zaklad", "zaktad", "dph", "oph", "bez dph", "bezdp h", "a 23", "23x", "23%"]) and not any(tok in norm_source for tok in ["ciastka", "clastka", "cena celkom", "karta", "na uhradu", "sucet", "medzisucet"]):
+            if any(tok in norm_source for tok in ["rekapitulacia", "sadzba", "zaklad", "zaktad", "dph", "oph", "bez dph", "bezdp h", "a 23", "23x", "23%"]) and not any(tok in norm_source for tok in ["ciastka", "clastka", "cena celkom", "karta", "na uhradu", "uhradene", "uhradit", "uhrada", "hotovost", "sucet", "medzisucet"]):
                 score -= 140
             if re.search(r"\d{1,6}\s*[,.]\s*\d(?!\d)", source_line) and not re.search(r"\d{1,6}\s*[,.]\s*\d{2}(?!\d)", source_line):
                 score -= 35
@@ -838,36 +883,80 @@ def find_vat_table(text, total=None):
             corrected_obrat = round(float(total) - float(rounding or 0.0), 2)
             if abs((selected["zaklad_dph"] + selected["dph"]) - corrected_obrat) <= 0.08:
                 selected["obrat_dph"] = corrected_obrat
-        expected_total = round(selected["obrat_dph"] + (rounding or 0.0), 2)
-        total_is_bad = total is None or abs(float(total) - expected_total) > max(0.08, min(0.20, abs(expected_total) * 0.003))
+        obrat_dph = round(float(selected["obrat_dph"]), 2)
+        expected_payment_total = round(obrat_dph + float(rounding or 0.0), 2)
+
         payment_source_norm = _normalize_text(payment_source or "")
-        text_has_change = any(tok in _normalize_text(text) for tok in ["vratene", "vraten", "vydavok", "vydane"])
-        hotovost_with_change = text_has_change and any(tok in payment_source_norm for tok in ["hotovost", "hotovosf"])
-        has_direct_payment_source = any(tok in payment_source_norm for tok in ["na uhradu", "cena celkom", "celkom", "karta", "ciastka", "clastka", "sucet", "medzisucet"])
-        short_cent_payment_source = bool(re.search(r"\d{1,6}\s*[,.]\s*\d(?!\d)", payment_source or "") and not re.search(r"\d{1,6}\s*[,.]\s*\d{2}(?!\d)", payment_source or ""))
-        celkom_payment_source = any(tok in payment_source_norm for tok in ["celkom", "clkom", "cekkom", "ceikom"])
-        if total_is_bad and hotovost_with_change:
-            total = selected["obrat_dph"]
-            payment_source = f"{payment_source} | hotovosť s výdavkom; suma dokladu opravená"
-        elif total_is_bad and short_cent_payment_source and celkom_payment_source:
-            total = selected["obrat_dph"]
-            payment_source = f"{payment_source} | suma opravená podľa Obrat DPH"
-        elif total_is_bad and not has_direct_payment_source:
-            total = expected_total
+
+        direct_payment_source = any(tok in payment_source_norm for tok in [
+            "uhradene",
+            "uhradit",
+            "na uhradu",
+            "uhrada",
+            "hotovost",
+            "hotovosf",
+            "karta",
+            "kartou",
+            "ciastka",
+            "clastka",
+        ])
+
+        gross_total_source = any(tok in payment_source_norm for tok in [
+            "celkom",
+            "clkom",
+            "cekkom",
+            "ceikom",
+            "spolu",
+            "sucet",
+            "medzisucet",
+            "cena celkom",
+            "obrat",
+        ])
+
+        if total is None:
+            total = expected_payment_total
             payment_source = payment_source or "úhrada odvodená z Obrat DPH + zaokrúhlenie"
+        else:
+            total = round(float(total), 2)
+
+            if abs(float(rounding or 0.0)) > 0.0001:
+                total_equals_obrat = abs(total - obrat_dph) <= 0.10
+                total_differs_from_expected_payment = abs(total - expected_payment_total) > 0.05
+
+                # Ak sa ako Suma na úhradu omylom zobralo CELKOM/SPOLU,
+                # ponecháme to ako Spolu s DPH a Suma na úhradu sa dopočíta cez zaokrúhlenie.
+                if gross_total_source and not direct_payment_source and total_equals_obrat:
+                    total = expected_payment_total
+                    payment_source = f"{payment_source} | úhrada opravená podľa Obrat DPH + zaokrúhlenie"
+
+                elif not direct_payment_source and total_differs_from_expected_payment:
+                    total = expected_payment_total
+                    payment_source = payment_source or "úhrada odvodená z Obrat DPH + zaokrúhlenie"
+
+        calculated_rounding = round(float(total) - obrat_dph, 2) if total is not None else rounding
+
+        if calculated_rounding is not None and abs(calculated_rounding) <= 0.10:
+            rounding = calculated_rounding
+
         best["zaklad_dph"] = selected["zaklad_dph"]
         best["dph"] = selected["dph"]
-        best["obrat_dph"] = selected["obrat_dph"]
-        best["spolu_s_dph"] = round(total, 2) if total is not None else selected["obrat_dph"]
+        best["obrat_dph"] = obrat_dph
+        best["spolu_s_dph"] = obrat_dph
         best["payment_total"] = round(total, 2) if total is not None else None
+        best["zaokruhlenie"] = rounding
         best["payment_source"] = payment_source
         best["sadzba_dph"] = "23 %"
         best["vat_source"] = f"DPH z bloku: {selected['source_line']}"
         return best
     if total is not None:
-        best["spolu_s_dph"] = round(total, 2)
-        best["payment_total"] = round(total, 2)
+        payment_total = round(float(total), 2)
+        gross_total = round(payment_total - float(rounding or 0.0), 2)
+
+        best["spolu_s_dph"] = gross_total
+        best["payment_total"] = payment_total
+        best["zaokruhlenie"] = round(payment_total - gross_total, 2)
         best["vat_source"] = "DPH sa nepodarilo prečítať"
+
     return best
 
 
