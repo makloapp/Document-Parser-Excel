@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_11.06.2026_10:52"
+APP_VERSION = "v_11.06.2026_11:40"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -342,7 +342,7 @@ def extract_receipt_frames_from_video(
     video_path,
     output_dir,
     sample_fps=4.0,
-    stable_diff_threshold=12.0,
+    stable_diff_threshold=20.0,
     min_stable_seconds=0.5,
     min_gap_seconds=1.5,
     max_frames=80,
@@ -525,7 +525,7 @@ else:
 
     with st.expander("Nastavenia delenia videa"):
         sample_fps = st.slider("Koľkokrát za sekundu kontrolovať video", 1.0, 8.0, 4.0, 0.5)
-        stable_diff_threshold = st.slider("Citlivosť zastavenia kamery", 1.0, 35.0, 12.0, 0.5)
+        stable_diff_threshold = st.slider("Citlivosť zastavenia kamery", 1.0, 35.0, 20.0, 0.5)
         min_stable_seconds = st.slider("Minimálna dĺžka zastavenia nad bločkom", 0.2, 3.0, 0.5, 0.1)
         min_gap_seconds = st.slider("Minimálny odstup medzi dvoma bločkami", 0.5, 5.0, 1.5, 0.1)
         max_frames = st.slider("Maximálny počet vybraných bločkov z videa", 5, 200, 80, 5)
@@ -540,6 +540,15 @@ else:
                 "180°"
             ],
             index=1
+        )
+
+    if st.session_state.get("last_blocks_zip"):
+        st.download_button(
+            label=f"Znova stiahnuť posledný ZIP s JPG blokmi ({st.session_state.get('last_blocks_zip_count', '?')} súborov)",
+            data=st.session_state["last_blocks_zip"],
+            file_name=st.session_state.get("last_blocks_zip_name", "vybrane_jpg_bloky.zip"),
+            mime="application/zip",
+            key="download_blocks_zip_persistent"
         )
 
     if uploaded_videos:
@@ -633,11 +642,16 @@ else:
 
                     blocks_zip = create_blocks_zip(all_input_files)
 
+                    st.session_state["last_blocks_zip"] = blocks_zip
+                    st.session_state["last_blocks_zip_name"] = "vybrane_jpg_bloky.zip"
+                    st.session_state["last_blocks_zip_count"] = len(all_input_files)
+
                     st.download_button(
                         label="Stiahnuť všetky vybrané JPG bloky ako ZIP",
-                        data=blocks_zip,
-                        file_name="vybrane_jpg_bloky.zip",
-                        mime="application/zip"
+                        data=st.session_state["last_blocks_zip"],
+                        file_name=st.session_state["last_blocks_zip_name"],
+                        mime="application/zip",
+                        key="download_blocks_zip_after_processing"
                     )
 
                     with st.expander("Ukážka vybraných JPG záberov"):
