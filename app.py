@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_11.06.2026_09:37"
+APP_VERSION = "v_11.06.2026_10:35"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -346,7 +346,8 @@ def extract_receipt_frames_from_video(
     min_stable_seconds=0.5,
     min_gap_seconds=1.5,
     max_frames=80,
-    rotation_mode="Bez otočenia"
+    rotation_mode="Bez otočenia",
+    video_prefix="video"
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -403,7 +404,7 @@ def extract_receipt_frames_from_video(
                     )
 
                     timestamp = format_video_timestamp(best_sample_index / sample_fps)
-                    output_path = output_dir / f"video_blok_{len(extracted) + 1:03d}_{timestamp}.jpg"
+                    output_path = output_dir / f"{video_prefix}_blok_{len(extracted) + 1:03d}_{timestamp}.jpg"
                     cv2.imwrite(str(output_path), best_frame)
 
                     extracted.append({
@@ -433,7 +434,7 @@ def extract_receipt_frames_from_video(
             )
 
             timestamp = format_video_timestamp(best_sample_index / sample_fps)
-            output_path = output_dir / f"video_blok_{len(extracted) + 1:03d}_{timestamp}.jpg"
+            output_path = output_dir / f"{video_prefix}_blok_{len(extracted) + 1:03d}_{timestamp}.jpg"
             cv2.imwrite(str(output_path), best_frame)
 
             extracted.append({
@@ -516,9 +517,10 @@ else:
     st.write("Nahraj video, v ktorom sú bločky snímané zľava doprava. Nad každým bločkom sa na chvíľu zastav.")
     st.write("Aplikácia z videa vyberie stabilné zábery, uloží ich ako JPG a následne ich spracuje cez OCR.")
 
-    uploaded_video = st.file_uploader(
-        "Vyber VIDEO súbor",
-        type=["mp4", "mov", "avi", "mkv", "webm"]
+    uploaded_videos = st.file_uploader(
+        "Vyber jeden alebo viac VIDEO súborov",
+        type=["mp4", "mov", "avi", "mkv", "webm"],
+        accept_multiple_files=True
     )
 
     with st.expander("Nastavenia delenia videa"):
@@ -540,53 +542,67 @@ else:
             index=1
         )
 
-    if uploaded_video is not None:
-        st.info(f"Nahrané video: {uploaded_video.name}")
+    if uploaded_videos:
+        st.info(f"Počet nahraných video súborov: {len(uploaded_videos)}")
 
         if st.button("Spracovať VIDEO"):
             with tempfile.TemporaryDirectory() as tmpdir_raw:
                 tmpdir = Path(tmpdir_raw)
 
-                video_suffix = Path(uploaded_video.name).suffix.lower()
-                video_path = tmpdir / f"video{video_suffix}"
-                video_path.write_bytes(uploaded_video.getbuffer())
+                all_input_files = []
 
-                extracted_dir = tmpdir / "video_jpg"
+                for video_index, uploaded_video in enumerate(uploaded_videos, start=1):
+                    video_suffix = Path(uploaded_video.name).suffix.lower()
+                    safe_video_stem = Path(uploaded_video.name).stem
+                    safe_video_stem = "".join(ch if ch.isalnum() or ch in ["-", "_"] else "_" for ch in safe_video_stem)
+                    video_prefix = f"video_{video_index:02d}_{safe_video_stem}"
 
-                with st.spinner("Rozdeľujem video na JPG zábery..."):
-                    try:
-                        input_files = extract_receipt_frames_from_video(
-                            video_path=video_path,
-                            output_dir=extracted_dir,
-                            sample_fps=sample_fps,
-                            stable_diff_threshold=stable_diff_threshold,
-                            min_stable_seconds=min_stable_seconds,
-                            min_gap_seconds=min_gap_seconds,
-                            max_frames=max_frames,
-                            rotation_mode=rotation_mode
-                        )
-                    except Exception as e:
-                        st.error(f"Video sa nepodarilo rozdeliť: {e}")
-                        input_files = []
+                    video_path = tmpdir / f"{video_prefix}{video_suffix}"
+                    video_path.write_bytes(uploaded_video.getbuffer())
 
-                if not input_files:
-                    st.error("Z videa sa nepodarilo vybrať žiadne stabilné zábery.")
-                    st.write("Skús video, kde sa nad každým bločkom zastavíš dlhšie, alebo zníž citlivosť zastavenia.")
+                    extracted_dir = tmpdir / "video_jpg" / video_prefix
+
+                    with st.spinner(f"Rozdeľujem video {video_index}/{len(uploaded_videos)}: {uploaded_video.name}"):
+                        try:
+                            input_files = extract_receipt_frames_from_video(
+                                video_path=video_path,
+                                output_dir=extracted_dir,
+                                sample_fps=sample_fps,
+                                stable_diff_threshold=stable_diff_threshold,
+                                min_stable_seconds=min_stable_seconds,
+                                min_gap_seconds=min_gap_seconds,
+                                max_frames=max_frames,
+                                rotation_mode=rotation_mode,
+                                video_prefix=video_prefix
+                            )
+                        except Exception as e:
+                            st.error(f"Video sa nepodarilo rozdeliť: {uploaded_video.name} — {e}")
+                            input_files = []
+
+                    if not input_files:
+                        st.warning(f"Z videa {uploaded_video.name} sa nepodarilo vybrať žiadne stabilné zábery.")
+                    else:
+                        st.success(f"Z videa {uploaded_video.name} bolo vybraných {len(input_files)} JPG záberov.")
+                        all_input_files.extend(input_files)
+
+                if not all_input_files:
+                    st.error("Zo žiadneho videa sa nepodarilo vybrať stabilné zábery.")
+                    st.write("Skús video, kde sa nad každým bločkom zastavíš dlhšie, alebo zvýš citlivosť zastavenia.")
                 else:
-                    st.success(f"Z videa bolo vybraných {len(input_files)} JPG záberov.")
+                    st.success(f"Celkovo bolo vybraných {len(all_input_files)} JPG záberov zo všetkých videí.")
 
-                    blocks_zip = create_blocks_zip(input_files)
+                    blocks_zip = create_blocks_zip(all_input_files)
 
                     st.download_button(
-                        label="Stiahnuť vybrané JPG bloky ako ZIP",
+                        label="Stiahnuť všetky vybrané JPG bloky ako ZIP",
                         data=blocks_zip,
                         file_name="vybrane_jpg_bloky.zip",
                         mime="application/zip"
                     )
 
                     with st.expander("Ukážka vybraných JPG záberov"):
-                        for file_item in input_files[:20]:
+                        for file_item in all_input_files[:30]:
                             st.image(str(file_item["path"]), caption=file_item["original_name"], use_container_width=True)
 
-                    results, excel_files = run_ocr_for_files(input_files, tmpdir)
+                    results, excel_files = run_ocr_for_files(all_input_files, tmpdir)
                     show_results_and_download(results, excel_files, one_row_per_source=True)
