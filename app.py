@@ -76,7 +76,7 @@ def run_ocr_for_files(input_files, tmpdir):
     return results, excel_files
 
 
-def create_combined_excel(excel_files):
+def create_combined_excel(excel_files, one_row_per_source=False):
     combined_sheets = {}
 
     for excel_item in excel_files:
@@ -112,12 +112,60 @@ def create_combined_excel(excel_files):
         for sheet_name, dataframes in combined_sheets.items():
             combined_df = pd.concat(dataframes, ignore_index=True)
             safe_sheet_name = str(sheet_name)[:31]
+
+            if one_row_per_source and safe_sheet_name == "Doklady":
+                source_col = None
+                for candidate_col in ["Názov súboru", "nazovSuboru", "Zdrojový súbor"]:
+                    if candidate_col in combined_df.columns:
+                        source_col = candidate_col
+                        break
+
+                if source_col:
+                    score_cols = [
+                        "Stav",
+                        "Dátum vystavenia",
+                        "Sadzba DPH",
+                        "Základ DPH",
+                        "DPH",
+                        "Suma na úhradu",
+                        "Spolu s DPH",
+                        "Obrat DPH",
+                        "Text",
+                    ]
+
+                    def row_score(row):
+                        score = 0
+
+                        stav = str(row.get("Stav", "")).lower()
+                        if "ok" in stav:
+                            score += 100
+                        if "blok nenajdeny" in stav or "blok nenájdený" in stav:
+                            score -= 100
+
+                        for col in score_cols:
+                            if col in combined_df.columns and pd.notna(row.get(col)) and str(row.get(col)).strip():
+                                score += 1
+
+                        text_value = str(row.get("Text", "")) if "Text" in combined_df.columns else ""
+                        score += min(len(text_value), 80) / 1000
+
+                        return score
+
+                    combined_df["_riadok_score"] = combined_df.apply(row_score, axis=1)
+                    combined_df = (
+                        combined_df
+                        .sort_values([source_col, "_riadok_score"], ascending=[True, False])
+                        .drop_duplicates(subset=[source_col], keep="first")
+                        .drop(columns=["_riadok_score"])
+                        .reset_index(drop=True)
+                    )
+
             combined_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
 
     return output_buffer.getvalue()
 
 
-def show_results_and_download(results, excel_files):
+def show_results_and_download(results, excel_files, one_row_per_source=False):
     st.subheader("Výsledky spracovania")
 
     for item in results:
@@ -132,7 +180,7 @@ def show_results_and_download(results, excel_files):
         return
 
     try:
-        combined_excel = create_combined_excel(excel_files)
+        combined_excel = create_combined_excel(excel_files, one_row_per_source=one_row_per_source)
     except Exception as e:
         st.error(f"Nepodarilo sa vytvoriť spoločný Excel: {e}")
         return
@@ -500,4 +548,4 @@ else:
                             st.image(str(file_item["path"]), caption=file_item["original_name"], use_container_width=True)
 
                     results, excel_files = run_ocr_for_files(input_files, tmpdir)
-                    show_results_and_download(results, excel_files)
+                    show_results_and_download(results, excel_files, one_row_per_source=True)
