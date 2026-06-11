@@ -1648,10 +1648,12 @@ def run_ocr(img):
         zaklad = row.get("zakladDph") is not None
         obrat = row.get("obratDph") is not None
         date = bool(row.get("datumVystavenia"))
-        if total and dph and (obrat or zaklad):
+        # OCR nezastavujeme iba podľa sumy a DPH.
+        # Pri Blok_3 sa stalo, že skorší OCR variant našiel sumy,
+        # ale dátum bol zlý alebo chýbal. Lepší variant PSM 6 mal dátum správne.
+        if date and total and (dph or obrat or zaklad):
             return True
-        if total and date and (dph or obrat or zaklad):
-            return True
+
         return False
 
     def should_stop_progressively():
