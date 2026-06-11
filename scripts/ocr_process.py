@@ -710,10 +710,8 @@ def find_date(text):
         regular_dates.sort(key=lambda item: item[0])
         return regular_dates[-1][4]
 
-    if compact_dates:
-        compact_dates.sort(key=lambda item: item[0])
-        return compact_dates[0][4]
-
+    # Kompaktné dátumy z dlhých technických čísel nepoužívame.
+    # Spôsobovali falošné dátumy z eKasa / UID / OKP / DKP kódov.
     return ""
 
 def find_date_source_debug(text):
