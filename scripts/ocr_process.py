@@ -1900,7 +1900,19 @@ def process_file(file_path: Path):
     receipt_counter = 1
 
     for page_number, page_img in pages:
-        boxes = detect_receipts(page_img)
+        h, w = page_img.shape[:2]
+
+        direct_image_input = file_path.suffix.lower() in {
+            ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"
+        }
+
+        if direct_image_input:
+            # Pri samostatnom JPG/PNG je vstup už jeden bloček.
+            # Nepoužívame agresívnu detekciu výrezov, lebo môže odrezať ľavú/pravú stranu.
+            boxes = [(0, 0, w, h)]
+        else:
+            boxes = detect_receipts(page_img)
+
         for box in boxes:
             x1, y1, x2, y2 = box
             h, w = page_img.shape[:2]
@@ -1909,6 +1921,19 @@ def process_file(file_path: Path):
             receipt_img = page_img[y1:y2, x1:x2]
             if receipt_img.size == 0:
                 continue
+            # DEBUG: uloz presny obrazok, ktory ide do OCR
+            debug_dir = Path("debug_ocr_images")
+            debug_dir.mkdir(exist_ok=True)
+            safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", file_path.stem)
+            debug_img_path = debug_dir / f"{safe_stem}_doklad_{receipt_counter:03d}_ocr_input.jpg"
+            try:
+                if hasattr(receipt_img, "shape") and len(receipt_img.shape) == 3:
+                    cv2.imwrite(str(debug_img_path), cv2.cvtColor(receipt_img, cv2.COLOR_RGB2BGR))
+                else:
+                    cv2.imwrite(str(debug_img_path), receipt_img)
+            except Exception:
+                pass
+
             ocr_text = run_ocr(receipt_img)
             row = parse_receipt_text(ocr_text, receipt_counter, file_path.name)
 
