@@ -1610,6 +1610,7 @@ def make_not_found_row(file_name):
         "paymentSource": "",
         "vatSource": "",
         "roundingSource": "",
+        "ocrTextPreview": "",
     }
 
 
@@ -1763,6 +1764,7 @@ def save_excel(rows, output_path: Path):
             "Zdroj zaokrúhlenia": row.get("roundingSource", ""),
             "Zdroj dátumu": row.get("dateSource", ""),
             "Všetky dátumy OCR": row.get("dateCandidates", ""),
+            "OCR text ukážka": row.get("ocrTextPreview", ""),
         })
     df = pd.DataFrame(excel_rows)
     visible_cols = [
@@ -1793,6 +1795,7 @@ def save_excel(rows, output_path: Path):
         ws["R1"] = "Zdroj zaokrúhlenia"
         ws["S1"] = "Zdroj dátumu"
         ws["T1"] = "Všetky dátumy OCR"
+        ws["U1"] = "OCR text ukážka"
 
         tolerance = 0.02
 
@@ -1857,6 +1860,7 @@ def save_excel(rows, output_path: Path):
                 ws[f"R{row_idx}"] = df.iloc[data_idx].get("Zdroj zaokrúhlenia", "")
                 ws[f"S{row_idx}"] = df.iloc[data_idx].get("Zdroj dátumu", "")
                 ws[f"T{row_idx}"] = df.iloc[data_idx].get("Všetky dátumy OCR", "")
+                ws[f"U{row_idx}"] = df.iloc[data_idx].get("OCR text ukážka", "")
 
         widths = {
             "A": 34,
@@ -1879,6 +1883,7 @@ def save_excel(rows, output_path: Path):
             "R": 55,
             "S": 70,
             "T": 100,
+            "U": 120,
         }
 
         for col, width in widths.items():
@@ -1906,6 +1911,10 @@ def process_file(file_path: Path):
                 continue
             ocr_text = run_ocr(receipt_img)
             row = parse_receipt_text(ocr_text, receipt_counter, file_path.name)
+
+            ocr_preview = ocr_text.replace("\r", " ").replace("\n", " | ")
+            ocr_preview = " ".join(ocr_preview.split())
+            row["ocrTextPreview"] = ocr_preview[:1200]
             if is_valid_receipt_row(row):
                 rows.append(row)
                 receipt_counter += 1

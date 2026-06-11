@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_11.06.2026_20:41"
+APP_VERSION = "v_11.06.2026_20:47"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -197,6 +197,7 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                     "Zdroj zaokrúhlenia",
                     "Zdroj dátumu",
                     "Všetky dátumy OCR",
+                    "OCR text ukážka",
                 ]
 
                 debug_source_values = {}
@@ -309,6 +310,7 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                     "R": 55,
                     "S": 70,
                     "T": 100,
+                    "U": 120,
                 }
 
                 for col, width in widths.items():
