@@ -1380,6 +1380,9 @@ def parse_receipt_text(text, receipt_id, file_name):
         "spoluSDph": format_eur(vat["spolu_s_dph"]),
         "sumaNaUhradu": format_eur(vat.get("payment_total", payment_total)),
         "popisNajvacsejPolozky": find_company_name(text),
+        "paymentSource": vat.get("payment_source", payment_source),
+        "vatSource": vat.get("vat_source", ""),
+        "roundingSource": vat.get("rounding_source", ""),
     }
 
 
@@ -1405,6 +1408,9 @@ def make_not_found_row(file_name):
         "spoluSDph": None,
         "sumaNaUhradu": None,
         "popisNajvacsejPolozky": "",
+        "paymentSource": "",
+        "vatSource": "",
+        "roundingSource": "",
     }
 
 
@@ -1551,6 +1557,9 @@ def save_excel(rows, output_path: Path):
             "Suma na úhradu": row.get("sumaNaUhradu"),
             "Sadzba DPH": row.get("sadzbaDph", ""),
             "Obrat DPH": row.get("obratDph"),
+            "Zdroj úhrady": row.get("paymentSource", ""),
+            "Zdroj DPH": row.get("vatSource", ""),
+            "Zdroj zaokrúhlenia": row.get("roundingSource", ""),
         })
     df = pd.DataFrame(excel_rows)
     visible_cols = [
@@ -1576,6 +1585,9 @@ def save_excel(rows, output_path: Path):
         ws["M1"] = "Check DPH"
         ws["N1"] = "Check úhrady"
         ws["O1"] = "Kontrola"
+        ws["P1"] = "Zdroj úhrady"
+        ws["Q1"] = "Zdroj DPH"
+        ws["R1"] = "Zdroj zaokrúhlenia"
 
         tolerance = 0.02
 
@@ -1633,6 +1645,12 @@ def save_excel(rows, output_path: Path):
             else:
                 ws[f"O{row_idx}"] = "OK"
 
+            data_idx = row_idx - 2
+            if 0 <= data_idx < len(df):
+                ws[f"P{row_idx}"] = df.iloc[data_idx].get("Zdroj úhrady", "")
+                ws[f"Q{row_idx}"] = df.iloc[data_idx].get("Zdroj DPH", "")
+                ws[f"R{row_idx}"] = df.iloc[data_idx].get("Zdroj zaokrúhlenia", "")
+
         widths = {
             "A": 34,
             "B": 10,
@@ -1649,6 +1667,9 @@ def save_excel(rows, output_path: Path):
             "M": 16,
             "N": 16,
             "O": 14,
+            "P": 55,
+            "Q": 80,
+            "R": 55,
         }
 
         for col, width in widths.items():

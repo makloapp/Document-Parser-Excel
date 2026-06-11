@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_11.06.2026_15:14"
+APP_VERSION = "v_11.06.2026_15:22"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -191,6 +191,20 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                     "Obrat DPH",
                 ]
 
+                debug_source_cols = [
+                    "Zdroj úhrady",
+                    "Zdroj DPH",
+                    "Zdroj zaokrúhlenia",
+                ]
+
+                debug_source_values = {}
+
+                for col in debug_source_cols:
+                    if col in combined_df.columns:
+                        debug_source_values[col] = combined_df[col].fillna("").astype(str).tolist()
+                    else:
+                        debug_source_values[col] = [""] * len(combined_df)
+
                 for col in visible_cols:
                     if col not in combined_df.columns:
                         combined_df[col] = ""
@@ -264,6 +278,9 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                 combined_df["Check úhrady"] = check_uhrady_values
                 combined_df["Kontrola"] = kontrola_values
 
+                for col in debug_source_cols:
+                    combined_df[col] = debug_source_values[col]
+
             combined_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
 
             if safe_sheet_name == "Doklady":
@@ -285,6 +302,9 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                     "M": 16,
                     "N": 16,
                     "O": 14,
+                    "P": 55,
+                    "Q": 80,
+                    "R": 55,
                 }
 
                 for col, width in widths.items():
