@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_11.06.2026_09:02"
+APP_VERSION = "v_11.06.2026_09:37"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -295,6 +295,18 @@ def rotate_video_frame(frame, rotation_mode):
     return frame
 
 
+
+def format_video_timestamp(seconds):
+    seconds = max(0, int(round(seconds)))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+
+    if hours > 0:
+        return f"{hours:02d}h{minutes:02d}m{secs:02d}s"
+
+    return f"{minutes:02d}m{secs:02d}s"
+
 def create_blocks_zip(input_files):
     zip_buffer = BytesIO()
 
@@ -390,12 +402,14 @@ def extract_receipt_frames_from_video(
                         key=lambda item: item[2]
                     )
 
-                    output_path = output_dir / f"video_blok_{len(extracted) + 1:03d}.jpg"
+                    timestamp = format_video_timestamp(best_sample_index / sample_fps)
+                    output_path = output_dir / f"video_blok_{len(extracted) + 1:03d}_{timestamp}.jpg"
                     cv2.imwrite(str(output_path), best_frame)
 
                     extracted.append({
                         "original_name": output_path.name,
-                        "path": output_path
+                        "path": output_path,
+                        "video_time_seconds": best_sample_index / sample_fps
                     })
 
                     last_saved_sample_index = best_sample_index
@@ -418,12 +432,14 @@ def extract_receipt_frames_from_video(
                 key=lambda item: item[2]
             )
 
-            output_path = output_dir / f"video_blok_{len(extracted) + 1:03d}.jpg"
+            timestamp = format_video_timestamp(best_sample_index / sample_fps)
+            output_path = output_dir / f"video_blok_{len(extracted) + 1:03d}_{timestamp}.jpg"
             cv2.imwrite(str(output_path), best_frame)
 
             extracted.append({
                 "original_name": output_path.name,
-                "path": output_path
+                "path": output_path,
+                "video_time_seconds": best_sample_index / sample_fps
             })
 
     cap.release()
