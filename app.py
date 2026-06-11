@@ -218,6 +218,34 @@ def load_uploaded_image_files(uploaded_files, tmpdir):
     return input_files
 
 
+
+def rotate_video_frame(frame, rotation_mode):
+    if rotation_mode == "Bez otočenia":
+        return frame
+
+    if rotation_mode == "90° doprava":
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+
+    if rotation_mode == "90° doľava":
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    if rotation_mode == "180°":
+        return cv2.rotate(frame, cv2.ROTATE_180)
+
+    if rotation_mode == "Auto na výšku - 90° doprava":
+        h, w = frame.shape[:2]
+        if w > h:
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        return frame
+
+    if rotation_mode == "Auto na výšku - 90° doľava":
+        h, w = frame.shape[:2]
+        if w > h:
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return frame
+
+    return frame
+
 def frame_difference(frame_a, frame_b):
     gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
     gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
@@ -241,7 +269,8 @@ def extract_receipt_frames_from_video(
     stable_diff_threshold=12.0,
     min_stable_seconds=0.5,
     min_gap_seconds=1.5,
-    max_frames=80
+    max_frames=80,
+    rotation_mode="Bez otočenia"
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -270,6 +299,8 @@ def extract_receipt_frames_from_video(
         ok, frame = cap.read()
         if not ok:
             break
+
+        frame = rotate_video_frame(frame, rotation_mode)
 
         if frame_index % frame_step != 0:
             frame_index += 1
@@ -416,6 +447,18 @@ else:
         min_stable_seconds = st.slider("Minimálna dĺžka zastavenia nad bločkom", 0.2, 3.0, 0.5, 0.1)
         min_gap_seconds = st.slider("Minimálny odstup medzi dvoma bločkami", 0.5, 5.0, 1.5, 0.1)
         max_frames = st.slider("Maximálny počet vybraných bločkov z videa", 5, 200, 80, 5)
+        rotation_mode = st.selectbox(
+            "Otočenie JPG záberov z videa",
+            [
+                "Bez otočenia",
+                "Auto na výšku - 90° doprava",
+                "Auto na výšku - 90° doľava",
+                "90° doprava",
+                "90° doľava",
+                "180°"
+            ],
+            index=1
+        )
 
     if uploaded_video is not None:
         st.info(f"Nahrané video: {uploaded_video.name}")
@@ -439,7 +482,8 @@ else:
                             stable_diff_threshold=stable_diff_threshold,
                             min_stable_seconds=min_stable_seconds,
                             min_gap_seconds=min_gap_seconds,
-                            max_frames=max_frames
+                            max_frames=max_frames,
+                            rotation_mode=rotation_mode
                         )
                     except Exception as e:
                         st.error(f"Video sa nepodarilo rozdeliť: {e}")
