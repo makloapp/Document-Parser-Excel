@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_11.06.2026_13:32"
+APP_VERSION = "v_11.06.2026_14:04"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -160,7 +160,139 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                         .reset_index(drop=True)
                     )
 
+            if safe_sheet_name == "Doklady":
+                control_cols_to_drop = [
+                    col for col in combined_df.columns
+                    if str(col).startswith("Unnamed")
+                    or str(col).strip() in [
+                        "Check súčet DPH",
+                        "Kontrola súčtu",
+                        "Check DPH",
+                        "Check úhrady",
+                        "Kontrola",
+                    ]
+                ]
+
+                if control_cols_to_drop:
+                    combined_df = combined_df.drop(columns=control_cols_to_drop, errors="ignore")
+
+                visible_cols = [
+                    "Názov súboru",
+                    "Doklad",
+                    "Stav",
+                    "Dátum vystavenia",
+                    "Základ DPH",
+                    "DPH",
+                    "Spolu s DPH",
+                    "Text",
+                    "Zaokrúhlenie",
+                    "Suma na úhradu",
+                    "Sadzba DPH",
+                    "Obrat DPH",
+                ]
+
+                for col in visible_cols:
+                    if col not in combined_df.columns:
+                        combined_df[col] = ""
+
+                combined_df = combined_df[visible_cols]
+
+                def to_money(value):
+                    if pd.isna(value):
+                        return None
+
+                    if isinstance(value, (int, float)):
+                        return float(value)
+
+                    txt = str(value).strip()
+                    txt = txt.replace("€", "")
+                    txt = txt.replace("\u00a0", "")
+                    txt = txt.replace(" ", "")
+
+                    if not txt:
+                        return None
+
+                    if "," in txt:
+                        txt = txt.replace(".", "")
+                        txt = txt.replace(",", ".")
+
+                    try:
+                        return float(txt)
+                    except Exception:
+                        return None
+
+                check_dph_values = []
+                check_uhrady_values = []
+                kontrola_values = []
+
+                tolerance = 0.02
+
+                for _, row in combined_df.iterrows():
+                    zaklad = to_money(row.get("Základ DPH"))
+                    dph = to_money(row.get("DPH"))
+                    obrat = to_money(row.get("Obrat DPH"))
+
+                    spolu = to_money(row.get("Spolu s DPH"))
+                    zaokruhlenie = to_money(row.get("Zaokrúhlenie"))
+                    suma_na_uhradu = to_money(row.get("Suma na úhradu"))
+
+                    check_dph = None
+                    if zaklad is not None and dph is not None and obrat is not None:
+                        check_dph = round(zaklad + dph - obrat, 2)
+
+                    check_uhrady = None
+                    if suma_na_uhradu is not None and spolu is not None and zaokruhlenie is not None:
+                        check_uhrady = round(suma_na_uhradu - spolu - zaokruhlenie, 2)
+
+                    check_dph_values.append(check_dph)
+                    check_uhrady_values.append(check_uhrady)
+
+                    has_any_check = check_dph is not None or check_uhrady is not None
+
+                    if not has_any_check:
+                        kontrola_values.append("")
+                    elif (
+                        (check_dph is not None and abs(check_dph) > tolerance)
+                        or
+                        (check_uhrady is not None and abs(check_uhrady) > tolerance)
+                    ):
+                        kontrola_values.append("Chyba")
+                    else:
+                        kontrola_values.append("OK")
+
+                combined_df["Check DPH"] = check_dph_values
+                combined_df["Check úhrady"] = check_uhrady_values
+                combined_df["Kontrola"] = kontrola_values
+
             combined_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+
+            if safe_sheet_name == "Doklady":
+                ws = writer.book[safe_sheet_name]
+
+                widths = {
+                    "A": 42,
+                    "B": 10,
+                    "C": 18,
+                    "D": 18,
+                    "E": 16,
+                    "F": 14,
+                    "G": 16,
+                    "H": 60,
+                    "I": 16,
+                    "J": 16,
+                    "K": 14,
+                    "L": 16,
+                    "M": 16,
+                    "N": 16,
+                    "O": 14,
+                }
+
+                for col, width in widths.items():
+                    ws.column_dimensions[col].width = width
+
+                for col_letter in ["E", "F", "G", "I", "J", "L", "M", "N"]:
+                    for cell in ws[col_letter][1:]:
+                        cell.number_format = '#,##0.00 €'
 
     return output_buffer.getvalue()
 

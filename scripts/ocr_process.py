@@ -1240,12 +1240,66 @@ def save_excel(rows, output_path: Path):
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         df[visible_cols].to_excel(writer, sheet_name="Doklady", index=False)
         ws = writer.book["Doklady"]
-        ws["N1"] = "Check súčet DPH"
-        ws["O1"] = "Kontrola súčtu"
-        tolerance = 0.002
+        ws["M1"] = "Check DPH"
+        ws["N1"] = "Check úhrady"
+        ws["O1"] = "Kontrola"
+
+        tolerance = 0.02
+
+        def parse_excel_money(value):
+            if value is None:
+                return None
+
+            if isinstance(value, (int, float)):
+                return float(value)
+
+            txt = str(value).strip()
+            txt = txt.replace("€", "")
+            txt = txt.replace("\u00a0", "")
+            txt = txt.replace(" ", "")
+
+            if not txt:
+                return None
+
+            if "," in txt:
+                txt = txt.replace(".", "")
+                txt = txt.replace(",", ".")
+
+            try:
+                return float(txt)
+            except Exception:
+                return None
+
         for row_idx in range(2, ws.max_row + 1):
-            ws[f"N{row_idx}"] = f"=IFERROR(E{row_idx}+F{row_idx}-M{row_idx},\"\")"
-            ws[f"O{row_idx}"] = f"=IF(N{row_idx}=\"\",\"\",IF(ABS(N{row_idx})>{tolerance},\"Chyba\",\"OK\"))"
+            zaklad = parse_excel_money(ws[f"E{row_idx}"].value)
+            dph = parse_excel_money(ws[f"F{row_idx}"].value)
+            spolu = parse_excel_money(ws[f"G{row_idx}"].value)
+            zaokruhlenie = parse_excel_money(ws[f"I{row_idx}"].value)
+            suma_na_uhradu = parse_excel_money(ws[f"J{row_idx}"].value)
+            obrat = parse_excel_money(ws[f"L{row_idx}"].value)
+
+            check_dph = None
+            if zaklad is not None and dph is not None and obrat is not None:
+                check_dph = round(zaklad + dph - obrat, 2)
+
+            check_uhrady = None
+            if suma_na_uhradu is not None and spolu is not None and zaokruhlenie is not None:
+                check_uhrady = round(suma_na_uhradu - spolu - zaokruhlenie, 2)
+
+            ws[f"M{row_idx}"] = check_dph
+            ws[f"N{row_idx}"] = check_uhrady
+
+            if check_dph is None and check_uhrady is None:
+                ws[f"O{row_idx}"] = ""
+            elif (
+                (check_dph is not None and abs(check_dph) > tolerance)
+                or
+                (check_uhrady is not None and abs(check_uhrady) > tolerance)
+            ):
+                ws[f"O{row_idx}"] = "Chyba"
+            else:
+                ws[f"O{row_idx}"] = "OK"
+
         widths = {
             "A": 34,
             "B": 10,
@@ -1253,22 +1307,23 @@ def save_excel(rows, output_path: Path):
             "D": 18,
             "E": 16,
             "F": 14,
-            "G": 12,
-            "H": 14,
-            "I": 60,
+            "G": 16,
+            "H": 60,
+            "I": 16,
             "J": 16,
-            "K": 16,
-            "L": 14,
-            "M": 14,
-            "N": 18,
-            "O": 18,
+            "K": 14,
+            "L": 16,
+            "M": 16,
+            "N": 16,
+            "O": 14,
         }
+
         for col, width in widths.items():
             ws.column_dimensions[col].width = width
-        for row in ws.iter_rows(min_row=2, min_col=6, max_col=14):
-            for cell in row:
-                if cell.column_letter != "I":
-                    cell.number_format = '#,##0.00 €'
+
+        for col_letter in ["E", "F", "G", "I", "J", "L", "M", "N"]:
+            for cell in ws[col_letter][1:]:
+                cell.number_format = '#,##0.00 €'
 
 
 def process_file(file_path: Path):
