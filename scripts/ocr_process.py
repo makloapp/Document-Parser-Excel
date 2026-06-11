@@ -1141,18 +1141,18 @@ def _extract_vat_line_candidates(line, total=None, rounding=0.0, prev_norm=""):
     if has_valid_triple_candidate or strict_vat_triple_context:
         return candidates
 
-        for i, zaklad in enumerate(values):
-            for j, dph in enumerate(values):
-                if i == j:
-                    continue
-                if zaklad <= 0 or dph <= 0:
-                    continue
-                if zaklad < dph:
-                    continue
-                ratio = dph / zaklad
-                if not (0.18 <= ratio <= 0.30):
-                    continue
-                add_candidate(zaklad, dph, None, "základ a DPH z riadku")
+    for i, zaklad in enumerate(values):
+        for j, dph in enumerate(values):
+            if i == j:
+                continue
+            if zaklad <= 0 or dph <= 0:
+                continue
+            if zaklad < dph:
+                continue
+            ratio = dph / zaklad
+            if not (0.18 <= ratio <= 0.30):
+                continue
+            add_candidate(zaklad, dph, None, "základ a DPH z riadku")
 
     return candidates
 
