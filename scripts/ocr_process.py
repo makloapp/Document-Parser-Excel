@@ -716,6 +716,65 @@ def find_date(text):
 
     return ""
 
+def find_date_source_debug(text):
+    date_value = find_date(text)
+
+    if not date_value:
+        return ""
+
+    try:
+        day, month, year = date_value.split(".")
+    except ValueError:
+        return ""
+
+    variants = [
+        f"{day}.{month}.{year}",
+        f"{day}-{month}-{year}",
+        f"{day}/{month}/{year}",
+        f"{day} {month} {year}",
+        f"{int(day)}.{int(month)}.{year}",
+        f"{int(day)}-{int(month)}-{year}",
+        f"{year}-{month}-{day}",
+        f"{year}.{month}.{day}",
+        f"{year}/{month}/{day}",
+    ]
+
+    compact_variants = [
+        f"{year[-2:]}{month}{day}",
+        f"{year}{month}{day}",
+    ]
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        converted = line.translate(str.maketrans({
+            "O": "0",
+            "o": "0",
+            "Q": "0",
+            "D": "0",
+            "A": "4",
+            "a": "4",
+            "I": "1",
+            "l": "1",
+            "|": "1",
+            "S": "5",
+            "s": "5",
+            "B": "8",
+            "G": "6",
+            "F": "6",
+        }))
+
+        if any(v in converted for v in variants):
+            return f"bežný dátum z riadku: {line}"
+
+        if any(v in converted for v in compact_variants):
+            return f"kompaktný dátum z riadku: {line}"
+
+    return f"zdroj dátumu sa nenašiel v riadkoch, hodnota: {date_value}"
+
+
 def _all_money_counter(text):
     values = []
     for line in text.splitlines():
@@ -1443,6 +1502,7 @@ def parse_receipt_text(text, receipt_id, file_name):
         "doklad": receipt_id if receipt_id != 0 else None,
         "stav": "OK",
         "datumVystavenia": find_date(text),
+        "dateSource": find_date_source_debug(text),
         "sadzbaDph": vat["sadzba_dph"],
         "zakladDph": format_eur(vat["zaklad_dph"]),
         "dph": format_eur(vat["dph"]),
@@ -1471,6 +1531,7 @@ def make_not_found_row(file_name):
         "doklad": None,
         "stav": "blok nenajdeny",
         "datumVystavenia": "",
+        "dateSource": "",
         "sadzbaDph": "",
         "zakladDph": None,
         "dph": None,
@@ -1631,6 +1692,7 @@ def save_excel(rows, output_path: Path):
             "Zdroj úhrady": row.get("paymentSource", ""),
             "Zdroj DPH": row.get("vatSource", ""),
             "Zdroj zaokrúhlenia": row.get("roundingSource", ""),
+            "Zdroj dátumu": row.get("dateSource", ""),
         })
     df = pd.DataFrame(excel_rows)
     visible_cols = [
@@ -1659,6 +1721,7 @@ def save_excel(rows, output_path: Path):
         ws["P1"] = "Zdroj úhrady"
         ws["Q1"] = "Zdroj DPH"
         ws["R1"] = "Zdroj zaokrúhlenia"
+        ws["S1"] = "Zdroj dátumu"
 
         tolerance = 0.02
 
@@ -1721,6 +1784,7 @@ def save_excel(rows, output_path: Path):
                 ws[f"P{row_idx}"] = df.iloc[data_idx].get("Zdroj úhrady", "")
                 ws[f"Q{row_idx}"] = df.iloc[data_idx].get("Zdroj DPH", "")
                 ws[f"R{row_idx}"] = df.iloc[data_idx].get("Zdroj zaokrúhlenia", "")
+                ws[f"S{row_idx}"] = df.iloc[data_idx].get("Zdroj dátumu", "")
 
         widths = {
             "A": 34,
@@ -1741,6 +1805,7 @@ def save_excel(rows, output_path: Path):
             "P": 55,
             "Q": 80,
             "R": 55,
+            "S": 70,
         }
 
         for col, width in widths.items():

@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_11.06.2026_15:28"
+APP_VERSION = "v_11.06.2026_15:37"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -195,6 +195,7 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                     "Zdroj úhrady",
                     "Zdroj DPH",
                     "Zdroj zaokrúhlenia",
+                    "Zdroj dátumu",
                 ]
 
                 debug_source_values = {}
@@ -305,6 +306,7 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                     "P": 55,
                     "Q": 80,
                     "R": 55,
+                    "S": 70,
                 }
 
                 for col, width in widths.items():
