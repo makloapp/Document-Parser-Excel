@@ -561,7 +561,7 @@ def find_date(text):
         converted = segment.translate(fuzzy_map)
 
         # DD.MM.RRRR / DD-MM-RRRR / DD/MM/RRRR / DD MM RRRR
-        for match in re.finditer(r"\b(\d{1,2})[\s.\/-]+(\d{1,2})[\s.,\/-]+(\d{2,4})\b", converted):
+        for match in re.finditer(r"\b(\d{1,2})[\s.\/-]+(\d{1,2})[\s.,\/-]+(20\d{2})\b", converted):
             day, month, year = match.groups()
             try:
                 day_i = int(day)
@@ -806,15 +806,14 @@ def find_all_date_candidates_debug(text):
         converted = raw_line.translate(fuzzy_map)
 
         # DD.MM.RRRR / DD-MM-RRRR / DD/MM/RRRR aj s medzerami
-        for m in re.finditer(r"\b(\d{1,2})[\s.\/-]+(\d{1,2})[\s.,\/-]+(\d{2,4})\b", converted):
+        for m in re.finditer(r"\b(\d{1,2})[\s.\/-]+(\d{1,2})[\s.,\/-]+(20\d{2})\b", converted):
             day, month, year = m.groups()
 
             try:
                 day_i = int(day)
                 month_i = int(month)
                 year_i = int(year)
-                if year_i < 100:
-                    year_i += 2000
+                # Rok musí byť 4-ciferný, napr. 2026.
             except ValueError:
                 continue
 
