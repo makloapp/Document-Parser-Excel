@@ -1308,6 +1308,46 @@ def _extract_vat_line_candidates(line, total=None, rounding=0.0, prev_norm=""):
                 "DPH tabuľka s poškodeným základom - základ dopočítaný"
             )
 
+    if len(values) == 2 and vat_table_hint:
+        # METRO a podobné bločky: OCR niekedy poškodí stĺpec DPH,
+        # ale správne prečíta základ a spolu, napr. "28,47 ... 35,02".
+        possible_zaklad = values[0]
+        possible_obrat = values[1]
+        possible_dph = round(possible_obrat - possible_zaklad, 2)
+
+        if possible_zaklad > 0 and possible_obrat > possible_zaklad:
+            ratio = possible_dph / possible_zaklad
+            if 0.18 <= ratio <= 0.30:
+                add_candidate(
+                    possible_zaklad,
+                    possible_dph,
+                    possible_obrat,
+                    "DPH tabuľka - DPH dopočítaná zo základu a spolu"
+                )
+
+    if len(values) >= 3 and vat_table_hint:
+        # Ak OCR riadok obsahuje základ a celkovú sumu, ale DPH stĺpec je poškodený
+        # napr. "23h 28,47 0,595 35,02", dopočítame DPH = spolu - základ.
+        for i, possible_zaklad in enumerate(values):
+            for j, possible_obrat in enumerate(values):
+                if i == j:
+                    continue
+                if possible_zaklad <= 0 or possible_obrat <= possible_zaklad:
+                    continue
+
+                possible_dph = round(possible_obrat - possible_zaklad, 2)
+                ratio = possible_dph / possible_zaklad
+
+                if not (0.18 <= ratio <= 0.30):
+                    continue
+
+                add_candidate(
+                    possible_zaklad,
+                    possible_dph,
+                    possible_obrat,
+                    "DPH tabuľka - DPH dopočítaná zo základu a spolu"
+                )
+
     if len(values) >= 3:
         for i in range(0, len(values) - 2):
             add_candidate(values[i], values[i + 1], values[i + 2], "riadok obsahuje základ, DPH/daň a obrat")
