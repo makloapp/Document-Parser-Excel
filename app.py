@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_11.06.2026_08:44"
+APP_VERSION = "v_11.06.2026_09:02"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -294,6 +294,22 @@ def rotate_video_frame(frame, rotation_mode):
 
     return frame
 
+
+def create_blocks_zip(input_files):
+    zip_buffer = BytesIO()
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for index, file_item in enumerate(input_files, start=1):
+            source_path = Path(file_item["path"])
+            original_name = file_item.get("original_name") or source_path.name
+
+            if not source_path.exists():
+                continue
+
+            zip_file.write(source_path, arcname=original_name)
+
+    return zip_buffer.getvalue()
+
 def frame_difference(frame_a, frame_b):
     gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
     gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
@@ -542,6 +558,15 @@ else:
                     st.write("Skús video, kde sa nad každým bločkom zastavíš dlhšie, alebo zníž citlivosť zastavenia.")
                 else:
                     st.success(f"Z videa bolo vybraných {len(input_files)} JPG záberov.")
+
+                    blocks_zip = create_blocks_zip(input_files)
+
+                    st.download_button(
+                        label="Stiahnuť vybrané JPG bloky ako ZIP",
+                        data=blocks_zip,
+                        file_name="vybrane_jpg_bloky.zip",
+                        mime="application/zip"
+                    )
 
                     with st.expander("Ukážka vybraných JPG záberov"):
                         for file_item in input_files[:20]:
