@@ -663,12 +663,45 @@ def find_payment_total(text):
 
     def add_candidates_from_line(idx, line, base_weight, source_line):
         values = [round(v, 2) for v in parse_money_values(line) if 0.10 <= abs(v) <= 100000]
+        norm_source = _normalize_text(source_line)
+
+        is_item_line = (
+            "eur/l" in norm_source
+            or "eur / l" in norm_source
+            or any(tok in norm_source for tok in [
+                "nafta",
+                "diesel",
+                "benzin",
+                "benzín",
+                "natural",
+                "evo ",
+            ])
+            or re.search(r"\b\d+(?:[,.]\d+)?\s*l\b", norm_source) is not None
+        )
+
+        is_real_payment_line = any(tok in norm_source for tok in [
+            "uhradene",
+            "uhradit",
+            "na uhradu",
+            "uhrada",
+            "cena celkom",
+            "ciastka",
+            "clastka",
+            "hotovost:",
+            "hotovosf:",
+            "karta:",
+            "kartou:",
+        ])
+
         for value in values:
             if value <= 0:
                 continue
+
+            if is_item_line and not is_real_payment_line:
+                continue
+
             repeat_bonus = min(counts[value], 4) * 18
             last_bonus = 10 if values and value == values[-1] else 0
-            norm_source = _normalize_text(source_line)
             score = base_weight + repeat_bonus + last_bonus
             value_count = len(values)
             if document_has_change and any(tok in norm_source for tok in ["hotovost", "hotovosf"]):
@@ -695,7 +728,14 @@ def find_payment_total(text):
         if weight == 0:
             continue
         add_candidates_from_line(idx, line, weight, line)
-        if not parse_money_values(line):
+
+        method_only_payment_line = (
+            "platba" in norm
+            and any(tok in norm for tok in ["hotovost", "hotovosf", "karta", "kartou"])
+            and not parse_money_values(line)
+        )
+
+        if not parse_money_values(line) and not method_only_payment_line:
             for j in range(idx + 1, min(len(lines), idx + 3)):
                 add_candidates_from_line(j, lines[j], max(30, weight - 12), f"{line} | {lines[j]}")
 
@@ -778,6 +818,40 @@ def _extract_vat_line_candidates(line, total=None, rounding=0.0, prev_norm=""):
     values = [round(v, 2) for v in parse_money_values(line) if 0.00 <= abs(v) <= 100000]
     if not values:
         return []
+
+    item_context = f"{prev_norm} {norm}"
+
+    is_item_line = (
+        "eur/l" in item_context
+        or "eur / l" in item_context
+        or any(tok in item_context for tok in [
+            "nafta",
+            "diesel",
+            "benzin",
+            "benzín",
+            "natural",
+            "evo ",
+        ])
+        or re.search(r"\b\d+(?:[,.]\d+)?\s*l\b", item_context) is not None
+    )
+
+    vat_table_hint = any(token in norm or token in prev_norm for token in [
+        "sadzba",
+        "zaklad",
+        "zaktad",
+        "dph",
+        "oph",
+        "dan",
+        "nan",
+        "obrat",
+        "rekapitulacia",
+        "triedy",
+        "spolu:",
+    ])
+
+    if is_item_line and not vat_table_hint:
+        return []
+
     vat_context = any(token in norm for token in ["sadzba", "zaklad", "zaktad", "dph", "oph", "dan", "nan", "obrat", "23%", "23 %", "03%", "03 %", "2s%", "2s %", "a 23", "a23"])
     if any(token in prev_norm for token in ["sadzba", "zaklad", "zaktad", "dph", "oph", "dan", "nan", "obrat", "rekapitulacia obratu", "rekapitulacia"]):
         vat_context = True
