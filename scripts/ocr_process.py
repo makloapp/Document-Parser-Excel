@@ -1124,14 +1124,27 @@ def save_excel(rows, output_path: Path):
             "Sadzba DPH": row.get("sadzbaDph", ""),
             "Základ DPH": row.get("zakladDph"),
             "DPH": row.get("dph"),
-            "Suma na úhradu": row.get("sumaNaUhradu"),
             "Spolu s DPH": row.get("spoluSDph"),
-            "Obrat DPH": row.get("obratDph"),
-            "Zaokrúhlenie": row.get("zaokruhlenie"),
             "Text": row.get("popisNajvacsejPolozky", ""),
+            "Zaokrúhlenie": row.get("zaokruhlenie"),
+            "Suma na úhradu": row.get("sumaNaUhradu"),
+            "Obrat DPH": row.get("obratDph"),
         })
     df = pd.DataFrame(excel_rows)
-    visible_cols = ["Názov súboru", "Doklad", "Stav", "Dátum vystavenia", "Sadzba DPH", "Základ DPH", "DPH", "Suma na úhradu", "Spolu s DPH", "Obrat DPH", "Zaokrúhlenie", "Text"]
+    visible_cols = [
+        "Názov súboru",
+        "Doklad",
+        "Stav",
+        "Dátum vystavenia",
+        "Sadzba DPH",
+        "Základ DPH",
+        "DPH",
+        "Spolu s DPH",
+        "Text",
+        "Zaokrúhlenie",
+        "Suma na úhradu",
+        "Obrat DPH",
+    ]
     for col in visible_cols:
         if col not in df.columns:
             df[col] = ""
@@ -1142,14 +1155,30 @@ def save_excel(rows, output_path: Path):
         ws["N1"] = "Kontrola súčtu"
         tolerance = 0.002
         for row_idx in range(2, ws.max_row + 1):
-            ws[f"M{row_idx}"] = f"=IFERROR(F{row_idx}+G{row_idx}-J{row_idx},\"\")"
+            ws[f"M{row_idx}"] = f"=IFERROR(F{row_idx}+G{row_idx}-L{row_idx},\"\")"
             ws[f"N{row_idx}"] = f"=IF(M{row_idx}=\"\",\"\",IF(ABS(M{row_idx})>{tolerance},\"Chyba\",\"OK\"))"
-        widths = {"A": 34, "B": 10, "C": 18, "D": 18, "E": 16, "F": 14, "G": 12, "H": 14, "I": 14, "J": 14, "K": 16, "L": 60}
+        widths = {
+            "A": 34,
+            "B": 10,
+            "C": 18,
+            "D": 18,
+            "E": 16,
+            "F": 14,
+            "G": 12,
+            "H": 14,
+            "I": 60,
+            "J": 16,
+            "K": 16,
+            "L": 14,
+            "M": 18,
+            "N": 18,
+        }
         for col, width in widths.items():
             ws.column_dimensions[col].width = width
-        for row in ws.iter_rows(min_row=2, min_col=6, max_col=11):
+        for row in ws.iter_rows(min_row=2, min_col=6, max_col=13):
             for cell in row:
-                cell.number_format = '#,##0.00 €'
+                if cell.column_letter != "I":
+                    cell.number_format = '#,##0.00 €'
 
 
 def process_file(file_path: Path):
