@@ -1121,13 +1121,13 @@ def save_excel(rows, output_path: Path):
             "Doklad": row.get("doklad", ""),
             "Stav": row.get("stav", ""),
             "Dátum vystavenia": row.get("datumVystavenia", ""),
-            "Sadzba DPH": row.get("sadzbaDph", ""),
             "Základ DPH": row.get("zakladDph"),
             "DPH": row.get("dph"),
             "Spolu s DPH": row.get("spoluSDph"),
             "Text": row.get("popisNajvacsejPolozky", ""),
             "Zaokrúhlenie": row.get("zaokruhlenie"),
             "Suma na úhradu": row.get("sumaNaUhradu"),
+            "Sadzba DPH": row.get("sadzbaDph", ""),
             "Obrat DPH": row.get("obratDph"),
         })
     df = pd.DataFrame(excel_rows)
@@ -1136,13 +1136,13 @@ def save_excel(rows, output_path: Path):
         "Doklad",
         "Stav",
         "Dátum vystavenia",
-        "Sadzba DPH",
         "Základ DPH",
         "DPH",
         "Spolu s DPH",
         "Text",
         "Zaokrúhlenie",
         "Suma na úhradu",
+        "Sadzba DPH",
         "Obrat DPH",
     ]
     for col in visible_cols:
@@ -1151,12 +1151,12 @@ def save_excel(rows, output_path: Path):
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         df[visible_cols].to_excel(writer, sheet_name="Doklady", index=False)
         ws = writer.book["Doklady"]
-        ws["M1"] = "Check súčet DPH"
-        ws["N1"] = "Kontrola súčtu"
+        ws["N1"] = "Check súčet DPH"
+        ws["O1"] = "Kontrola súčtu"
         tolerance = 0.002
         for row_idx in range(2, ws.max_row + 1):
-            ws[f"M{row_idx}"] = f"=IFERROR(F{row_idx}+G{row_idx}-L{row_idx},\"\")"
-            ws[f"N{row_idx}"] = f"=IF(M{row_idx}=\"\",\"\",IF(ABS(M{row_idx})>{tolerance},\"Chyba\",\"OK\"))"
+            ws[f"N{row_idx}"] = f"=IFERROR(E{row_idx}+F{row_idx}-M{row_idx},\"\")"
+            ws[f"O{row_idx}"] = f"=IF(N{row_idx}=\"\",\"\",IF(ABS(N{row_idx})>{tolerance},\"Chyba\",\"OK\"))"
         widths = {
             "A": 34,
             "B": 10,
@@ -1170,12 +1170,13 @@ def save_excel(rows, output_path: Path):
             "J": 16,
             "K": 16,
             "L": 14,
-            "M": 18,
+            "M": 14,
             "N": 18,
+            "O": 18,
         }
         for col, width in widths.items():
             ws.column_dimensions[col].width = width
-        for row in ws.iter_rows(min_row=2, min_col=6, max_col=13):
+        for row in ws.iter_rows(min_row=2, min_col=6, max_col=14):
             for cell in row:
                 if cell.column_letter != "I":
                     cell.number_format = '#,##0.00 €'
