@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_12.06.2026_11:28"
+APP_VERSION = "v_12.06.2026_11:39"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -397,7 +397,7 @@ def show_results_and_download(results, excel_files, one_row_per_source=False):
         st.download_button(
             label="Stiahnuť spoločný Excel",
             data=combined_excel,
-            file_name="spolocny_vystup.xlsx",
+            file_name="Doklady_spracovane.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     else:
@@ -761,7 +761,7 @@ else:
         st.download_button(
             label=f"Znova stiahnuť posledný výstupný Excel ({st.session_state.get('last_output_excel_count', '?')} riadkov)",
             data=st.session_state["last_output_excel"],
-            file_name=st.session_state.get("last_output_excel_name", "doklady_vystup.xlsx"),
+            file_name="Doklady_spracovane.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="download_output_excel_persistent"
         )
