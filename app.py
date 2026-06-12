@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_11.06.2026_21:28"
+APP_VERSION = "v_12.06.2026_10:44"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -169,6 +169,7 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                         "Kontrola súčtu",
                         "Check DPH",
                         "Check úhrady",
+                        "Check sadzby DPH",
                         "Kontrola",
                     ]
                 ]
@@ -279,10 +280,56 @@ def create_combined_excel(excel_files, one_row_per_source=False):
 
                 combined_df["Check DPH"] = check_dph_values
                 combined_df["Check úhrady"] = check_uhrady_values
+
+                def to_percent(value):
+                    if value is None:
+                        return None
+
+                    text_value = str(value).replace("%", " ").replace(",", ".")
+                    current = ""
+
+                    for ch in text_value:
+                        if ch.isdigit() or ch in ".-":
+                            current += ch
+                        elif current:
+                            try:
+                                return float(current)
+                            except ValueError:
+                                current = ""
+
+                    if current:
+                        try:
+                            return float(current)
+                        except ValueError:
+                            return None
+
+                    return None
+
+                check_sadzby_values = []
+
+                for _, row in combined_df.iterrows():
+                    zaklad_rate = to_money(row.get("Základ DPH"))
+                    dph_rate = to_money(row.get("DPH"))
+                    sadzba_rate = to_percent(row.get("Sadzba DPH"))
+
+                    if zaklad_rate is None or dph_rate is None or sadzba_rate is None:
+                        check_sadzby_values.append(None)
+                        continue
+
+                    expected_dph = round(zaklad_rate * sadzba_rate / 100.0, 2)
+                    check_sadzby = round(dph_rate - expected_dph, 2)
+                    check_sadzby_values.append(check_sadzby)
+
+                for idx, check_sadzby in enumerate(check_sadzby_values):
+                    if check_sadzby is not None and abs(check_sadzby) > 0.01:
+                        kontrola_values[idx] = "Chyba"
+
                 combined_df["Kontrola"] = kontrola_values
 
                 for col in debug_source_cols:
                     combined_df[col] = debug_source_values[col]
+
+                combined_df["Check sadzby DPH"] = check_sadzby_values
 
             combined_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
 
@@ -311,12 +358,13 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                     "S": 70,
                     "T": 100,
                     "U": 120,
+                    "V": 18,
                 }
 
                 for col, width in widths.items():
                     ws.column_dimensions[col].width = width
 
-                for col_letter in ["E", "F", "G", "I", "J", "L", "M", "N"]:
+                for col_letter in ["E", "F", "G", "I", "J", "L", "M", "N", "V"]:
                     for cell in ws[col_letter][1:]:
                         cell.number_format = '#,##0.00 €'
 

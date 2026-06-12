@@ -853,7 +853,7 @@ def find_payment_total(text):
     lines = [line.strip() for line in text.splitlines() if line.strip() and not _is_debug_line(line)]
     counts = _all_money_counter(text)
 
-    change_tokens = ["vratene", "vraten", "vratit", "vydavok", "vydane"]
+    change_tokens = ["vratene", "vraten", "vratit", "vydavok", "vydane", "yratene", "yraten", "yratit", "vra tene", "yra tene"]
     cash_tokens = ["hotovost", "hotovosf"]
 
     # Ak je na bločku HOTOVOSŤ a potom VRÁTENÉ,
@@ -945,7 +945,7 @@ def find_payment_total(text):
         ("suma:", 220), ("suma", 190), ("spolu", 35),
     ]
     candidates = []
-    document_has_change = any(any(tok in _normalize_text(line) for tok in ["vratene", "vraten", "vratit", "vydavok", "vydane"]) for line in lines)
+    document_has_change = any(any(tok in _normalize_text(line) for tok in change_tokens) for line in lines)
 
     def add_candidates_from_line(idx, line, base_weight, source_line):
         values = [round(v, 2) for v in parse_money_values(line) if 0.10 <= abs(v) <= 100000]
@@ -1280,7 +1280,7 @@ def _extract_vat_line_candidates(line, total=None, rounding=0.0, prev_norm=""):
                 score += 30
             elif pay_diff > max(0.50, total * 0.05):
                 score -= 180
-        candidates.append({"score": score, "zaklad_dph": zaklad, "dph": dph, "obrat_dph": obrat, "spolu_s_dph": round(total, 2) if total is not None else expected_total, "ratio": ratio, "source_line": line, "source_note": f"{source_note}{source_note_extra}"})
+        candidates.append({"score": score, "zaklad_dph": zaklad, "dph": dph, "obrat_dph": obrat, "spolu_s_dph": obrat, "ratio": ratio, "source_line": line, "source_note": f"{source_note}{source_note_extra}"})
 
     if len(values) == 2 and vat_table_hint:
         possible_dph = values[0]
@@ -1836,6 +1836,7 @@ def save_excel(rows, output_path: Path):
         ws["S1"] = "Zdroj dátumu"
         ws["T1"] = "Všetky dátumy OCR"
         ws["U1"] = "OCR text ukážka"
+        ws["V1"] = "Check sadzby DPH"
 
         tolerance = 0.02
 
@@ -1902,6 +1903,21 @@ def save_excel(rows, output_path: Path):
                 ws[f"T{row_idx}"] = df.iloc[data_idx].get("Všetky dátumy OCR", "")
                 ws[f"U{row_idx}"] = df.iloc[data_idx].get("OCR text ukážka", "")
 
+                zaklad_rate = parse_excel_money(ws[f"E{row_idx}"].value)
+                dph_rate = parse_excel_money(ws[f"F{row_idx}"].value)
+                sadzba_raw = str(ws[f"K{row_idx}"].value or "")
+
+                sadzba_match = re.search(r"(\d+(?:[,.]\d+)?)", sadzba_raw)
+
+                if zaklad_rate is not None and dph_rate is not None and sadzba_match:
+                    sadzba_rate = float(sadzba_match.group(1).replace(",", "."))
+                    expected_dph = round(zaklad_rate * sadzba_rate / 100.0, 2)
+                    check_sadzby = round(dph_rate - expected_dph, 2)
+                    ws[f"V{row_idx}"] = check_sadzby
+
+                    if abs(check_sadzby) > 0.01:
+                        ws[f"O{row_idx}"] = "Chyba"
+
         widths = {
             "A": 34,
             "B": 10,
@@ -1924,12 +1940,13 @@ def save_excel(rows, output_path: Path):
             "S": 70,
             "T": 100,
             "U": 120,
+            "V": 18,
         }
 
         for col, width in widths.items():
             ws.column_dimensions[col].width = width
 
-        for col_letter in ["E", "F", "G", "I", "J", "L", "M", "N"]:
+        for col_letter in ["E", "F", "G", "I", "J", "L", "M", "N", "V"]:
             for cell in ws[col_letter][1:]:
                 cell.number_format = '#,##0.00 €'
 
