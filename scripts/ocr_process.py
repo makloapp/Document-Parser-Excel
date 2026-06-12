@@ -1554,6 +1554,9 @@ def find_company_name(text):
         "autoriz", "potvrdenka", "dakujem", "uschovajte", "bodov",
         "overenie", "terminal", "mastercard", "visa", "contactless",
         "zaokruh", "sadzba",
+        "nazov", "názov", "tovar", "mnozstvo", "množstvo", "cena", "mj",
+        " ks", " eur", "euro", "celk", "dan", "daň", "ekasa", "pokladnicny",
+        "pokladničný", "doklad", "kluc", "kľúč",
     ]
 
     def is_skip(norm):
@@ -1957,6 +1960,256 @@ def save_excel(rows, output_path: Path):
                 cell.number_format = '#,##0.00 €'
 
 
+
+def run_header_ocr_for_text(img):
+    # Samostatné OCR hornej časti bločku pre stĺpec Text/názov firmy.
+    # Hlavné run_ocr() niekedy vyberie dobré účtovné údaje,
+    # ale v zloženom texte chýba úplne prvý riadok bločku.
+    try:
+        h, w = img.shape[:2]
+        crop_h = max(120, int(h * 0.28))
+        crop = img[0:min(h, crop_h), 0:w]
+
+        variants = dict(generate_ocr_variants(crop))
+        processed = variants.get("gray")
+
+        if processed is None:
+            return ""
+
+        timeout = int(CONFIG.get("tesseract_timeout_seconds", 30))
+        primary_lang = str(CONFIG.get("ocr_language", "slk+eng") or "slk+eng")
+        fallback_lang = str(CONFIG.get("ocr_fallback_language", "eng") or "").strip()
+
+        attempts = []
+
+        for psm in [6, 4, 11]:
+            config_str = f"--oem 3 --psm {psm}"
+
+            try:
+                txt = pytesseract.image_to_string(
+                    processed,
+                    lang=primary_lang,
+                    config=config_str,
+                    timeout=timeout,
+                )
+            except Exception:
+                txt = ""
+
+            if not txt.strip() and fallback_lang:
+                try:
+                    txt = pytesseract.image_to_string(
+                        processed,
+                        lang=fallback_lang,
+                        config=config_str,
+                        timeout=timeout,
+                    )
+                except Exception:
+                    txt = ""
+
+            if txt.strip():
+                bonus = 0
+                norm_txt = _normalize_text(txt)
+
+                if any(tok in norm_txt for tok in ["s r o", "spol", "a s", "metro", "slovnaft", "zeko"]):
+                    bonus += 80
+
+                if any(tok in norm_txt for tok in ["ico", "dic", "ic dph", "prevadzka"]):
+                    bonus += 20
+
+                attempts.append((_ocr_score(txt) + bonus, txt))
+
+        if not attempts:
+            return ""
+
+        attempts.sort(reverse=True, key=lambda item: item[0])
+
+        lines = []
+        seen = set()
+
+        for _score, txt in attempts[:2]:
+            for raw_line in txt.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+
+                key = re.sub(r"\s+", " ", line.lower())
+                if key in seen:
+                    continue
+
+                seen.add(key)
+                lines.append(line)
+
+                if len(lines) >= 12:
+                    break
+
+            if len(lines) >= 12:
+                break
+
+        return "\n".join(lines)
+
+    except Exception:
+        return ""
+
+def _text_field_is_bad_line(line: str) -> bool:
+    norm = _normalize_text(line or "")
+    if not norm.strip():
+        return True
+
+    bad_tokens = [
+        "prevadzka", "prevádzka", "ico", "ičo", "dic", "dič", "ic dph", "ič dph",
+        "datum", "dátum", "cas", "čas", "dokl", "doklad", "kp", "uid", "okp", "dkp",
+        "nazov", "názov", "mnozstvo", "množstvo", "cena", "spolu", "celkom",
+        "dph", "dan", "daň", "obrat", "platob", "karta", "hotovost", "hotovosť",
+        "ekasa", "qr", "eur", " ks", " x ",
+    ]
+
+    if any(tok in norm for tok in bad_tokens):
+        return True
+
+    letters = sum(ch.isalpha() for ch in line)
+    digits = sum(ch.isdigit() for ch in line)
+
+    if letters < 3:
+        return True
+
+    # Adresné riadky typu "91701 Trnava" alebo "Bulharská 44".
+    if digits >= 2 and any(tok in norm for tok in ["ul", "trnava", "bratislava", "kosice", "košice", "bulharska", "bulharská"]):
+        return True
+
+    return False
+
+
+def _cleanup_company_text_for_export(value: str) -> str:
+    s = str(value or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    s = s.strip(" -—_|:;,.")
+
+    # Časté OCR zámeny v právnej forme.
+    s = re.sub(r"\bspol\s*[.,]?\s*s\s*r\s*[.,]?\s*[gq0o]\s*[.,]?", "spol. s r.o.", s, flags=re.I)
+    s = re.sub(r"\bs\s*r\s*[.,]?\s*[gq0o]\s*[.,]?", "s r.o.", s, flags=re.I)
+
+    # Častá zámena O/U v názve KOMPONENTY.
+    s = re.sub(r"\bKUMPONENTY\b", "KOMPONENTY", s, flags=re.I)
+
+    # ZEKO-ELEKTR O KOMPONENTY -> ZEKO-ELEKTRO KOMPONENTY
+    s = re.sub(r"\bELEKTR\s+O\b", "ELEKTRO", s, flags=re.I)
+
+    s = s.replace("spol. s r.o..", "spol. s r.o.")
+    return s.strip()
+
+
+
+def pick_text_field_from_header(header_text: str) -> str:
+    # Vyberá iba názov firmy / prevádzky z hornej časti bločku.
+    # Nikdy nemá vrátiť celý horný OCR blok.
+    header_text = str(header_text or "").replace("\\n", "\n")
+    raw_lines = [ln.strip() for ln in header_text.splitlines() if ln.strip()]
+    if not raw_lines:
+        return ""
+
+    # Vyhoď technické riadky z debug OCR.
+    lines = []
+    for ln in raw_lines[:20]:
+        low = ln.lower()
+        if low.startswith("--- ocr pokus"):
+            continue
+        if "score=" in low and "psm" in low:
+            continue
+        lines.append(ln)
+
+    if not lines:
+        return ""
+
+    def norm(s):
+        return _normalize_text(s or "")
+
+    def cleanup(value):
+        s = str(value or "").strip()
+        s = re.sub(r"\s+", " ", s)
+        s = s.strip(" -—_|:;,.")
+
+        # Časté OCR opravy názvov/právnej formy.
+        s = re.sub(r"\bKUMPONENTY\b", "KOMPONENTY", s, flags=re.I)
+        s = re.sub(r"\bELEKTR\s+O\b", "ELEKTRO", s, flags=re.I)
+        s = re.sub(r"\bspol\s*[.,]?\s*s\s*r\s*[.,]?\s*[gq0o]\s*[.,]?", "spol. s r.o.", s, flags=re.I)
+        s = re.sub(r"\bs\s*r\s*[.,]?\s*[gq0o]\s*[.,]?", "s r.o.", s, flags=re.I)
+        s = s.replace("ZEKO-ELEKTR O ", "ZEKO-ELEKTRO ")
+        s = s.replace("spol. s r.o..", "spol. s r.o.")
+        return s.strip()
+
+    def is_bad_fragment(s):
+        n = norm(s)
+        if not n:
+            return True
+
+        bad_tokens = [
+            "prevadzka", "prevádzka", "ico", "ičo", "dic", "dič",
+            "ic dph", "ič dph", "datum", "dátum", "cas", "čas",
+            "dokl", "doklad", "kp", "uid", "okp", "dkp",
+            "nazov", "názov", "mnozstvo", "množstvo", "cena",
+            "spolu", "celkom", "dph", "obrat", "platob", "karta",
+            "hotovost", "hotovosť", "ekasa", "qr", "eur", " ks", " x ",
+        ]
+
+        if any(tok in n for tok in bad_tokens):
+            return True
+
+        # Adresy, PSČ a čísla nechceme ako názov.
+        if any(ch.isdigit() for ch in s):
+            return True
+
+        if sum(ch.isalpha() for ch in s) < 3:
+            return True
+
+        return False
+
+    legal_tokens = [
+        "spol", "s r o", "s.r.o", "s r.g", "s r g",
+        "a s", "a.s", "metro", "slovnaft",
+    ]
+
+    # 1) Najprv hľadaj riadok s právnou formou / známym názvom firmy.
+    for i, line in enumerate(lines[:14]):
+        n = norm(line)
+        if not any(tok in n for tok in legal_tokens):
+            continue
+
+        legal_line = line
+
+        # Názvový fragment hľadaj nad právnou formou; pri rozbitom OCR môže byť o 2-3 riadky vyššie.
+        name_fragment = ""
+        for prev in reversed(lines[max(0, i - 6):i]):
+            if is_bad_fragment(prev):
+                continue
+            name_fragment = prev
+            break
+
+        if name_fragment:
+            if name_fragment.upper().endswith("ELEKTR"):
+                legal_line = re.sub(r"^[0O]\s+", "O ", legal_line)
+            candidate = f"{name_fragment} {legal_line}"
+        else:
+            candidate = legal_line
+
+        candidate = cleanup(candidate)
+        candidate = " ".join(candidate.splitlines()).strip()
+
+        if candidate:
+            return candidate
+
+    # 2) Ak právna forma nie je čitateľná, zober prvý horný riadok bez čísiel/adresy.
+    for line in lines[:8]:
+        if is_bad_fragment(line):
+            continue
+
+        candidate = cleanup(line)
+        candidate = " ".join(candidate.splitlines()).strip()
+
+        if candidate:
+            return candidate
+
+    return ""
+
 def process_file(file_path: Path):
     pages = load_input_file(file_path)
     rows = []
@@ -1998,7 +2251,15 @@ def process_file(file_path: Path):
                 pass
 
             ocr_text = run_ocr(receipt_img)
+
+            header_ocr_text = run_header_ocr_for_text(receipt_img)
+            if header_ocr_text.strip():
+                ocr_text = header_ocr_text.strip() + "\n" + ocr_text
             row = parse_receipt_text(ocr_text, receipt_counter, file_path.name)
+
+            header_company_text = pick_text_field_from_header(header_ocr_text if 'header_ocr_text' in locals() else "")
+            if header_company_text:
+                row["popisNajvacsejPolozky"] = header_company_text
 
             ocr_preview = ocr_text.replace("\r", " ").replace("\n", " | ")
             ocr_preview = " ".join(ocr_preview.split())

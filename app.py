@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_12.06.2026_11:44"
+APP_VERSION = "v_12.06.2026_12:37"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
