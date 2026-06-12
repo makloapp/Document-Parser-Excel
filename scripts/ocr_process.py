@@ -1417,11 +1417,17 @@ def find_vat_table(text, total=None):
     if candidate_rows:
         candidate_rows.sort(reverse=True, key=lambda item: item["score"])
         selected = candidate_rows[0]
-        if total is not None and rounding is not None:
-            corrected_obrat = round(float(total) - float(rounding or 0.0), 2)
-            if abs((selected["zaklad_dph"] + selected["dph"]) - corrected_obrat) <= 0.08:
-                selected["obrat_dph"] = corrected_obrat
         obrat_dph = round(float(selected["obrat_dph"]), 2)
+
+        # DPH tabuľka má prednosť pre Obrat/Spolu.
+        # Ak máme reálnu úhradu, zaokrúhlenie dopočítame z úhrady a obratu.
+        if payment_total is not None:
+            computed_rounding = round(float(payment_total) - obrat_dph, 2)
+
+            if rounding is None or abs(float(rounding) - computed_rounding) > 0.02:
+                rounding = computed_rounding
+                rounding_source = "zaokrúhlenie opravené podľa úhrady a DPH tabuľky"
+
         expected_payment_total = round(obrat_dph + float(rounding or 0.0), 2)
 
         payment_source_norm = _normalize_text(payment_source or "")
