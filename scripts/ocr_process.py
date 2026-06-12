@@ -1874,8 +1874,8 @@ def save_excel(rows, output_path: Path):
             zaklad = parse_excel_money(ws[f"E{row_idx}"].value)
             dph = parse_excel_money(ws[f"F{row_idx}"].value)
             spolu = parse_excel_money(ws[f"G{row_idx}"].value)
-            zaokruhlenie = parse_excel_money(ws[f"I{row_idx}"].value)
-            suma_na_uhradu = parse_excel_money(ws[f"J{row_idx}"].value)
+            zaokruhlenie = parse_excel_money(ws[f"H{row_idx}"].value)
+            suma_na_uhradu = parse_excel_money(ws[f"I{row_idx}"].value)
             obrat = parse_excel_money(ws[f"L{row_idx}"].value)
 
             check_dph = None
@@ -1934,7 +1934,7 @@ def save_excel(rows, output_path: Path):
             "G": 16,
             "H": 60,
             "I": 16,
-            "J": 16,
+            "J": 45,
             "K": 14,
             "L": 16,
             "M": 16,
@@ -1952,7 +1952,7 @@ def save_excel(rows, output_path: Path):
         for col, width in widths.items():
             ws.column_dimensions[col].width = width
 
-        for col_letter in ["E", "F", "G", "I", "J", "L", "M", "N", "V"]:
+        for col_letter in ["E", "F", "G", "H", "I", "L", "M", "N", "V"]:
             for cell in ws[col_letter][1:]:
                 cell.number_format = '#,##0.00 €'
 

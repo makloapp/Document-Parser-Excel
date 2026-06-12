@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_12.06.2026_11:16"
+APP_VERSION = "v_12.06.2026_11:28"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -185,9 +185,9 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                     "Základ DPH",
                     "DPH",
                     "Spolu s DPH",
-                    "Text",
                     "Zaokrúhlenie",
                     "Suma na úhradu",
+                    "Text",
                     "Sadzba DPH",
                     "Obrat DPH",
                 ]
@@ -346,7 +346,7 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                     "G": 16,
                     "H": 60,
                     "I": 16,
-                    "J": 16,
+                    "J": 45,
                     "K": 14,
                     "L": 16,
                     "M": 16,
@@ -364,7 +364,7 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                 for col, width in widths.items():
                     ws.column_dimensions[col].width = width
 
-                for col_letter in ["E", "F", "G", "I", "J", "L", "M", "N", "V"]:
+                for col_letter in ["E", "F", "G", "H", "I", "L", "M", "N", "V"]:
                     for cell in ws[col_letter][1:]:
                         cell.number_format = '#,##0.00 €'
 
