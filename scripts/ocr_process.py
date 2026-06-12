@@ -2210,6 +2210,88 @@ def pick_text_field_from_header(header_text: str) -> str:
 
     return ""
 
+def _text_override_current_is_bad(current_text: str) -> bool:
+    s = str(current_text or "").strip()
+    if not s:
+        return True
+
+    # Ak je v Text viacriadkový OCR blok, je to zlé pole Text.
+    if "\n" in s or "\\n" in s:
+        return True
+
+    n = _normalize_text(s)
+
+    bad_tokens = [
+        " ks", " eur", " x ", "dph", "obrat", "zaklad", "základ",
+        "sucet", "súčet", "zaplatit", "zaplatiť", "uhradu", "úhradu",
+        "platob", "karta", "hotovost", "hotovosť", "doklad", "datum", "dátum",
+        "mnozstvo", "množstvo", "cena", "spolu", "celkom",
+    ]
+
+    if any(tok in n for tok in bad_tokens):
+        return True
+
+    digits = sum(ch.isdigit() for ch in s)
+    letters = sum(ch.isalpha() for ch in s)
+
+    if letters < 3:
+        return True
+
+    # Riadok s množstvom/sumou alebo číslami je podozrivý ako názov firmy.
+    if digits >= 3:
+        return True
+
+    return False
+
+
+def _text_override_header_is_reliable(header_text: str) -> bool:
+    s = str(header_text or "").replace("\\n", " ").replace("\n", " ").strip()
+    s = re.sub(r"\s+", " ", s)
+
+    if not s or len(s) > 90:
+        return False
+
+    n = _normalize_text(s)
+
+    # Toto sú technické/adresné riadky, nie názov firmy.
+    bad_tokens = [
+        "ico", "ičo", "dic", "dič", "ic dph", "ič dph",
+        "prevadzka", "prevádzka", "slovensko", "doklad",
+        "datum", "dátum", "kp", "uid", "okp", "dkp",
+        "mnozstvo", "množstvo", "cena", "spolu", "dph",
+        "obrat", "eur", " ks", " x ",
+    ]
+
+    if any(tok in n for tok in bad_tokens):
+        return False
+
+    reliable_tokens = [
+        "spol", "s r o", "s.r.o", "a s", "a.s", "k s", "k.s", "k. s",
+        "hornbach", "bauhaus", "piesok", "zeko", "metro", "slovnaft",
+        "obi", "mountfield", "dek", "alza",
+    ]
+
+    if not any(tok in n for tok in reliable_tokens):
+        return False
+
+    letters = sum(ch.isalpha() for ch in s)
+    weird = sum((not ch.isalnum() and ch not in " .,-/&+()") for ch in s)
+
+    if letters < 4:
+        return False
+
+    if weird >= 4:
+        return False
+
+    return True
+
+
+def should_override_text_from_header(current_text: str, header_text: str) -> bool:
+    # Header OCR môže prepísať Text iba vtedy, keď:
+    # 1. aktuálny Text je zjavne zlý,
+    # 2. header kandidát je spoľahlivý názov firmy.
+    return _text_override_current_is_bad(current_text) and _text_override_header_is_reliable(header_text)
+
 def process_file(file_path: Path):
     pages = load_input_file(file_path)
     rows = []
@@ -2253,12 +2335,11 @@ def process_file(file_path: Path):
             ocr_text = run_ocr(receipt_img)
 
             header_ocr_text = run_header_ocr_for_text(receipt_img)
-            if header_ocr_text.strip():
-                ocr_text = header_ocr_text.strip() + "\n" + ocr_text
             row = parse_receipt_text(ocr_text, receipt_counter, file_path.name)
 
             header_company_text = pick_text_field_from_header(header_ocr_text if 'header_ocr_text' in locals() else "")
-            if header_company_text:
+            current_company_text = row.get("popisNajvacsejPolozky", "")
+            if header_company_text and should_override_text_from_header(current_company_text, header_company_text):
                 row["popisNajvacsejPolozky"] = header_company_text
 
             ocr_preview = ocr_text.replace("\r", " ").replace("\n", " | ")
