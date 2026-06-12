@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 
-APP_VERSION = "v_12.06.2026_11:39"
+APP_VERSION = "v_12.06.2026_11:44"
 
 st.set_page_config(page_title="Spracovanie skenov dokladov", layout="centered")
 
@@ -344,7 +344,7 @@ def create_combined_excel(excel_files, one_row_per_source=False):
                     "E": 16,
                     "F": 14,
                     "G": 16,
-                    "H": 60,
+                    "H": 16,
                     "I": 16,
                     "J": 45,
                     "K": 14,

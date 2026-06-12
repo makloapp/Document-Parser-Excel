@@ -1932,7 +1932,7 @@ def save_excel(rows, output_path: Path):
             "E": 16,
             "F": 14,
             "G": 16,
-            "H": 60,
+            "H": 16,
             "I": 16,
             "J": 45,
             "K": 14,
