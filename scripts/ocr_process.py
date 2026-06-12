@@ -1608,6 +1608,245 @@ def find_company_name(text):
     return " | ".join(header_parts)
 
 
+def _vat_repair_to_float(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    s = str(value).replace("\xa0", " ").strip()
+    if not s:
+        return None
+
+    m = re.search(r"[-+]?\d+(?:[,.]\d{1,2})?", s)
+    if not m:
+        return None
+
+    try:
+        return float(m.group(0).replace(",", "."))
+    except Exception:
+        return None
+
+
+def _vat_repair_money_values(line):
+    values = []
+    for m in re.finditer(r"(?<!\d)[-+]?\d{1,6}[,.]\d{1,2}(?!\d)", str(line or "")):
+        try:
+            values.append(float(m.group(0).replace(",", ".")))
+        except Exception:
+            pass
+    return values
+
+
+def _vat_repair_norm(value):
+    try:
+        return _normalize_text(value)
+    except Exception:
+        s = str(value or "").lower()
+        table = str.maketrans("áäčďéíĺľňóôŕšťúýž", "aacdeillnoorstuyz")
+        return s.translate(table)
+
+
+def _vat_repair_find_rate(text, row):
+    rate = _vat_repair_to_float(row.get("sadzbaDph"))
+    if rate is not None and 1 <= rate <= 30:
+        return rate
+
+    t = str(text or "")
+    m = re.search(r"(?<!\d)(5|10|19|20|23)\s*%", t)
+    if m:
+        return float(m.group(1))
+
+    return 23.0
+
+
+def _vat_repair_find_base_from_text(text, rate):
+    best = None
+    best_score = -1
+
+    for raw_line in str(text or "").replace("\\n", "\n").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        norm = _vat_repair_norm(line)
+        values = _vat_repair_money_values(line)
+
+        if not values:
+            continue
+
+        score = 0
+
+        if "%" in line or f"{int(rate)}" in line:
+            score += 40
+
+        if "sadzba" in norm or "zaklad" in norm or "dph" in norm or "spolu" in norm:
+            score += 20
+
+        if re.search(rf"(?<!\d){int(rate)}\s*%", line):
+            score += 40
+
+        # V riadku DPH tabuľky býva prvé desatinné číslo po sadzbe základ.
+        # Príklad Streamlit OCR: "A 23% 15,74 365 na:"
+        candidate = values[0]
+
+        # Základ nesmie byť sadzba ani nulová hodnota.
+        if candidate <= 0 or abs(candidate - rate) < 0.01:
+            continue
+
+        if score > best_score:
+            best = candidate
+            best_score = score
+
+    if best_score >= 40:
+        return round(float(best), 2)
+
+    return None
+
+
+def _vat_repair_find_gross_from_text(text):
+    preferred_tokens = [
+        "na uhradu", "na úhradu", "medzisucet", "medzisúčet",
+        "sucet", "súčet", "zaplatit", "zaplatiť", "celkom",
+    ]
+
+    best = None
+    best_score = -1
+
+    for raw_line in str(text or "").replace("\\n", "\n").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        norm = _vat_repair_norm(line)
+        values = _vat_repair_money_values(line)
+
+        if not values:
+            continue
+
+        score = 0
+        if any(tok in norm for tok in preferred_tokens):
+            score += 100
+
+        if "eur" in norm:
+            score += 10
+
+        # Pri riadkoch typu "NA ÚHRADU EUR 19,36" je správna posledná suma.
+        candidate = values[-1]
+
+        if candidate <= 0:
+            continue
+
+        if score > best_score:
+            best = candidate
+            best_score = score
+
+    if best is not None and best_score >= 50:
+        return round(float(best), 2)
+
+    return None
+
+
+def repair_missing_vat_from_gross_and_base(row, text):
+    """Bezpečný fallback pre DPH.
+
+    Použije sa iba vtedy, keď Základ DPH / DPH / Obrat chýba alebo matematicky nesedí.
+    Ak už parser našiel DPH tabuľku správne, funkcia nič nemení a nezmení ani Zdroj DPH.
+    """
+    try:
+        if not isinstance(row, dict):
+            return row
+
+        current_base = _vat_repair_to_float(row.get("zakladDph"))
+        current_vat = _vat_repair_to_float(row.get("dph"))
+        current_gross = _vat_repair_to_float(row.get("spoluSDph")) or _vat_repair_to_float(row.get("obratDph"))
+        payment_total = _vat_repair_to_float(row.get("sumaNaUhradu"))
+        rounding = _vat_repair_to_float(row.get("zaokruhlenie"))
+
+        rate = _vat_repair_find_rate(text, row)
+
+        # Ak už máme kompletné a matematicky sediace DPH údaje, nerob nič.
+        if current_base is not None and current_vat is not None and current_gross is not None:
+            expected_vat_existing = round(float(current_base) * float(rate) / 100.0, 2)
+            check_sum_existing = round(float(current_base) + float(current_vat) - float(current_gross), 2)
+            check_rate_existing = round(float(current_vat) - expected_vat_existing, 2)
+
+            if abs(check_sum_existing) <= 0.08 and abs(check_rate_existing) <= 0.08:
+                return row
+
+        base = current_base
+        if base is None:
+            base = _vat_repair_find_base_from_text(text, rate)
+
+        gross = current_gross
+        if gross is None and payment_total is not None:
+            gross = round(payment_total - float(rounding or 0.0), 2)
+
+        if gross is None:
+            gross = _vat_repair_find_gross_from_text(text)
+
+        if base is None or gross is None:
+            return row
+
+        base = round(float(base), 2)
+        gross = round(float(gross), 2)
+        inferred_vat = round(gross - base, 2)
+
+        if inferred_vat <= 0:
+            return row
+
+        expected_vat = round(base * float(rate) / 100.0, 2)
+
+        # Tolerancia kvôli OCR a zaokrúhleniu.
+        if abs(inferred_vat - expected_vat) > 0.08:
+            return row
+
+        changed_values = False
+
+        # Oprav iba chýbajúce alebo zjavne zlé hodnoty.
+        if current_base is None:
+            row["zakladDph"] = base
+            changed_values = True
+
+        current_vat_bad = (
+            current_vat is None
+            or abs(float(current_vat) - expected_vat) > 0.08
+            or abs((base + float(current_vat or 0.0)) - gross) > 0.08
+        )
+
+        if current_vat_bad:
+            row["dph"] = inferred_vat
+            changed_values = True
+
+        if _vat_repair_to_float(row.get("spoluSDph")) is None:
+            row["spoluSDph"] = gross
+            changed_values = True
+
+        if _vat_repair_to_float(row.get("obratDph")) is None:
+            row["obratDph"] = gross
+            changed_values = True
+
+        if not row.get("sadzbaDph"):
+            row["sadzbaDph"] = f"{int(rate)} %"
+            changed_values = True
+
+        # Zdroj DPH zmeň iba vtedy, keď fallback reálne niečo doplnil/opravil.
+        if changed_values:
+            source_note = f"DPH dopočítaná z obratu a základu: {gross:.2f} - {base:.2f} = {inferred_vat:.2f}"
+
+            for key in ["zdrojDph", "sourceDph", "dphSource", "vatSource"]:
+                if not row.get(key):
+                    row[key] = source_note
+
+        return row
+
+    except Exception:
+        return row
+
 def parse_receipt_text(text, receipt_id, file_name):
     payment_total, payment_source = find_payment_total(text)
     vat = find_vat_table(text, total=payment_total)
@@ -2354,6 +2593,7 @@ def process_file(file_path: Path):
     if not rows:
         rows.append(make_not_found_row(file_path.name))
 
+    row = repair_missing_vat_from_gross_and_base(row, ocr_text)
     return rows
 
 
